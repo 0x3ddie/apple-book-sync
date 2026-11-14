@@ -83,18 +83,25 @@ After pairing the Mac, connect the Mac and phone to the same Wi-Fi. On the Mac, 
 ./scripts/start-transfers.sh
 ```
 
-The script creates an isolated, git-ignored environment at `.local/transfer-venv` and installs `aiortc==1.16.0` and its dependencies from PyPI. It needs Python 3.11 or newer. Transfers stay available for 30 minutes by default; use `./scripts/start-transfers.sh --minutes 60` to choose a window from 1 to 480 minutes. Keep the Mac awake and the command running; Control-C stops it. The command syncs library metadata when it starts and once a minute while running.
+The script creates an isolated, git-ignored environment at `.local/transfer-venv` and installs `aiortc==1.16.0`, PyObjC Cocoa 13.0 on macOS, and their dependencies from PyPI. It needs Python 3.11 or newer. Transfers stay available for 30 minutes by default; use `./scripts/start-transfers.sh --minutes 60` to choose a window from 1 to 480 minutes. Keep the Mac awake and the command running; Control-C stops it. The command syncs library metadata when it starts and once a minute while running.
 
 To keep the paired companion running automatically, let that first command finish installing its dependencies, stop it with **Control-C**, then run:
 
 ```sh
-python3 background.py install
+python3 background.py authorize
 python3 background.py status
 ```
 
-This copies the required companion files and Python environment into `~/Library/Application Support/Apple Books Companion`, installs a per-user macOS LaunchAgent, and starts the companion immediately. It starts again when you log into this Mac and restarts after failures. No Terminal window needs to remain open, and the installed service does not depend on the original checkout staying in place. Run `python3 background.py install` again from an updated checkout to refresh the installed copy; pairing and saved progress are kept. The background process checks local library metadata once a minute and uploads it only when it changes. It polls for transfers every 20 seconds while idle and every 5 seconds during a transfer.
+This copies the required companion files and Python environment into `~/Library/Application Support/Apple Books Companion` and installs a per-user macOS LaunchAgent. A separate setup process opens two native folder pickers using the installed interpreter. Confirm **Allow this folder** for each preselected directory:
 
-For new downloads, keep the Mac awake, logged in, and online, with the phone on the same Wi-Fi. macOS may ask to let **Python** access data from other apps; allow that request so the companion can read Apple Books. This permission lasts only for the process lifetime, so the prompt can return after login or an automatic restart. Unattended reading after restarts requires a persistent access grant, which this installer does not configure. Permission granted to Terminal or a development app does not automatically cover the background process. [Apple's app-data permission explanation](https://developer.apple.com/videos/play/wwdc2023/10053/?time=1203)
+- `~/Library/Containers/com.apple.iBooksX/Data/Documents` — library metadata, reading positions, and annotations.
+- `~/Library/Mobile Documents/iCloud~com~apple~iBooks/Documents` — EPUB files in the iCloud Books library.
+
+The setup accepts only these exact directories and saves their native URL bookmarks in a private `0600` file. It does not grant Full Disk Access. This version targets the iCloud Books layout; additional EPUB storage locations are not authorized by this flow. Cancellation leaves the background sender stopped and preserves any previous saved setup. The folder picker is experimental until access has been verified across independent companion processes on your Mac; saving a bookmark alone is not proof of persistent permission.
+
+After both selections, the companion starts automatically. It starts again when you log into this Mac and restarts after failures. No Terminal window needs to remain open, and the installed service does not depend on the original checkout staying in place. Run `python3 background.py install` from an updated checkout to refresh the installed copy; pairing, selected-folder bookmarks, and saved progress are kept. The background process checks local library metadata once a minute and uploads it only when it changes. It polls for transfers every 20 seconds while idle and every 5 seconds during a transfer. A transient interrupted read retries without restarting; readiness is advertised only after the initial library read succeeds.
+
+For new downloads, keep the Mac awake, logged in, and online, with the phone on the same Wi-Fi. Without working folder-specific consent, macOS may ask to let **Python** access data from other apps. That broader prompt lasts only for the process lifetime, so it can return after login or a restart. Permission granted to Terminal or a development app does not automatically cover the background process. The setup therefore runs the picker independently under launchd, then restores the selected folder URLs in the sender. [Apple's app-data permission explanation](https://developer.apple.com/videos/play/wwdc2023/10053/)
 
 Logs are in `~/Library/Application Support/Apple Books Companion/.local/companion-background.log`. To stop it and remove automatic startup:
 
@@ -103,6 +110,8 @@ python3 background.py uninstall
 ```
 
 Uninstalling the background service keeps the Mac pairing, the Apple Books library, and books already saved on your phone.
+
+Live verification confirmed the installed LaunchAgent can read the library and transfer an EPUB after macOS permission is granted. A forced process stop triggered an automatic replacement with the same pairing, but macOS requested app-data access again. The transferred EPUB and browser login survived a full page reload; fully unattended access after restarts still depends on the persistent permission setup described above.
 
 On the phone, sign in to the hosted app, tap **Refresh library**, then choose **Save offline** for each book you want. The EPUB must already be downloaded and readable in Apple Books on the Mac. Wait until the app confirms that the book is saved, then open it or find it under **Saved on this device**. You can remove each browser copy with **Remove download**. Cloud transfers copy the EPUB only; separate cover-image files are not transferred, so the shelf may use text covers.
 

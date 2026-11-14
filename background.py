@@ -15,9 +15,10 @@ from companion import CONFIG, RUNTIME, CompanionError, migrate_legacy_config, re
 
 
 LABEL = "xyz.eddiechen.books-companion"
+PERMISSIONS_LABEL = f"{LABEL}.permissions"
 ROOT = Path(__file__).resolve().parent
 LAUNCHCTL = "/bin/launchctl"
-RUNTIME_MODULES = ("companion.py", "transfer.py", "library.py", "prepare.py")
+RUNTIME_MODULES = ("companion.py", "transfer.py", "library.py", "prepare.py", "background.py", "mac_permissions.py")
 
 
 def service_definition(root):
@@ -39,6 +40,23 @@ def service_definition(root):
     }
 
 
+def permissions_definition(root):
+    root = Path(root).resolve()
+    log = str(root / ".local/companion-background.log")
+    return {
+        "Label": PERMISSIONS_LABEL,
+        "ProgramArguments": [str(root / ".local/transfer-venv/bin/python"),
+                             str(root / "background.py"), "grant-folders"],
+        "WorkingDirectory": str(root),
+        "RunAtLoad": True,
+        "KeepAlive": False,
+        "ProcessType": "Interactive",
+        "EnvironmentVariables": {"PYTHONUNBUFFERED": "1"},
+        "StandardOutPath": log,
+        "StandardErrorPath": log,
+    }
+
+
 class BackgroundService:
     def __init__(self, root=ROOT, home=None, uid=None, run=subprocess.run, runtime=RUNTIME, config_path=CONFIG):
         self.root = Path(root).resolve()
@@ -49,6 +67,9 @@ class BackgroundService:
         self.uid = os.getuid() if uid is None else uid
         self.domain = f"gui/{self.uid}"
         self.target = f"{self.domain}/{LABEL}"
+        self.permissions_target = f"{self.domain}/{PERMISSIONS_LABEL}"
+        # A one-shot picker must never open automatically at login.
+        self.permissions_plist = self.runtime / ".local" / f"{PERMISSIONS_LABEL}.plist"
         self.run = run
 
     def command(self, *arguments, required=True):
@@ -80,6 +101,21 @@ class BackgroundService:
                                  "It was left unchanged.")
         return definition
 
+    def installed_permissions_definition(self):
+        try:
+            info = self.permissions_plist.lstat()
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise CompanionError("The folder-access setup plist must be an owned regular file with permissions 0600.")
+        try:
+            definition = plistlib.loads(self.permissions_plist.read_bytes())
+        except (ValueError, plistlib.InvalidFileException):
+            raise CompanionError("The existing folder-access setup plist is invalid; it was left unchanged.") from None
+        if definition != permissions_definition(self.runtime):
+            raise CompanionError("The existing folder-access setup plist belongs to a different command. It was left unchanged.")
+        return definition
+
     def validate_install(self):
         if self.config_path == CONFIG:
             migrate_legacy_config()
@@ -92,11 +128,12 @@ class BackgroundService:
             executable = environment / "bin/python"
             if not executable.is_file() or not os.access(executable, os.X_OK):
                 continue
-            result = self.run([str(executable), "-c", 'import aiortc; assert aiortc.__version__ == "1.16.0"'],
+            result = self.run([str(executable), "-c",
+                               'import aiortc, AppKit, objc; assert aiortc.__version__ == "1.16.0"; assert objc.__version__ == "13.0"'],
                               capture_output=True, text=True, timeout=20)
             if not result.returncode:
                 return environment
-        raise CompanionError("Direct-transfer dependencies are missing or outdated. Run ./scripts/start-transfers.sh first.")
+        raise CompanionError("Companion dependencies are missing or outdated. Run ./scripts/start-transfers.sh first.")
 
     @staticmethod
     def private_directory(path):
@@ -131,7 +168,20 @@ class BackgroundService:
                 if os.path.exists(temporary):
                     os.unlink(temporary)
 
-    def install(self):
+    @staticmethod
+    def write_definition(path, definition):
+        descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                plistlib.dump(definition, output)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def install(self, *, start=True):
         environment = self.validate_install()
         previous = self.installed_definition()
         loaded = self.command("print", self.target, required=False).returncode == 0
@@ -151,19 +201,44 @@ class BackgroundService:
             os.fchmod(descriptor, 0o600)
         finally:
             os.close(descriptor)
-        descriptor, temporary = tempfile.mkstemp(prefix=f".{LABEL}-", dir=self.plist.parent)
-        try:
-            with os.fdopen(descriptor, "wb") as output:
-                plistlib.dump(service_definition(self.runtime), output)
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(temporary, self.plist)
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+        self.write_definition(self.plist, service_definition(self.runtime))
+        if start:
+            self.start_installed()
+        return self.status()
+
+    def start_installed(self):
+        if self.installed_definition() != service_definition(self.runtime):
+            raise CompanionError("Install the current companion before starting it.")
         self.command("enable", self.target)
         self.command("bootstrap", self.domain, str(self.plist))
-        return self.status()
+
+    def authorize(self):
+        previous = self.installed_permissions_definition()
+        loaded = self.command("print", self.permissions_target, required=False).returncode == 0
+        if loaded and previous is None:
+            raise CompanionError("A folder-access setup service is loaded without its owned plist. It was left unchanged.")
+        if loaded:
+            self.command("bootout", self.permissions_target)
+        # Stage everything while the normal sender is stopped. Its first Books read
+        # happens only after the launchd-owned picker process grants folder access.
+        self.install(start=False)
+        self.write_definition(self.permissions_plist, permissions_definition(self.runtime))
+        self.command("enable", self.permissions_target)
+        self.command("bootstrap", self.domain, str(self.permissions_plist))
+
+    def grant_folders(self):
+        if self.installed_permissions_definition() is None:
+            raise CompanionError("Run background.py authorize to prepare folder access first.")
+        if self.installed_definition() != service_definition(self.runtime):
+            raise CompanionError("The companion installation changed. Run background.py authorize again.")
+        # This import and native picker run on this launchd process's main thread.
+        from mac_permissions import authorize_folders
+        if not authorize_folders():
+            print("Folder access setup cancelled. The background companion remains stopped.", flush=True)
+            return False
+        self.start_installed()
+        print("Folder access saved. The background companion has started.", flush=True)
+        return True
 
     def status(self):
         installed = self.installed_definition() is not None
@@ -176,19 +251,28 @@ class BackgroundService:
         return info
 
     def uninstall(self):
-        if self.installed_definition() is None:
-            if self.command("print", self.target, required=False).returncode == 0:
-                raise CompanionError("The service is loaded without this checkout's LaunchAgent; it was left unchanged.")
-            return False
-        if self.command("print", self.target, required=False).returncode == 0:
+        main = self.installed_definition()
+        permissions = self.installed_permissions_definition()
+        loaded = self.command("print", self.target, required=False).returncode == 0
+        setup_loaded = self.command("print", self.permissions_target, required=False).returncode == 0
+        if loaded and main is None or setup_loaded and permissions is None:
+            raise CompanionError("A companion service is loaded without its owned plist; it was left unchanged.")
+        # Stop an open picker before removing the main agent so a later selection
+        # cannot restart the companion after the user has uninstalled it.
+        if setup_loaded:
+            self.command("bootout", self.permissions_target)
+        if loaded:
             self.command("bootout", self.target)
-        self.plist.unlink()
-        return True
+        if permissions is not None:
+            self.permissions_plist.unlink()
+        if main is not None:
+            self.plist.unlink()
+        return main is not None or permissions is not None
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("install", "status", "uninstall"))
+    parser.add_argument("command", choices=("install", "status", "uninstall", "authorize", "grant-folders"))
     arguments = parser.parse_args()
     if sys.platform != "darwin":
         parser.error("The background companion uses macOS LaunchAgents.")
@@ -196,6 +280,12 @@ def main():
         parser.error("Run this as your normal Mac user, without sudo.")
     service = BackgroundService()
     try:
+        if arguments.command == "authorize":
+            service.authorize()
+            print("Choose the requested Apple Books folders in the Mac dialogs. The companion starts after both are approved.")
+            return 0
+        if arguments.command == "grant-folders":
+            return 0 if service.grant_folders() else 1
         if arguments.command == "uninstall":
             removed = service.uninstall()
             print("Background companion stopped and removed." if removed else "Background companion is not installed.")

@@ -216,12 +216,24 @@ async def _serve_transfers(*, minutes, path, background):
     next_sync = 0
     connected = False
     connection_warning = False
+
+    async def refresh_metadata():
+        result = await asyncio.to_thread(sync, path, library, client,
+                                         skip_unchanged=background, quiet=background)
+        if background and result["changed"]:
+            print(f"Updated library metadata for {result['books']} books.", flush=True)
+        return time.monotonic() + 60
+
     try:
         while time.monotonic() < deadline:
             if not Path(path).exists():
                 print("Local Mac pairing was removed. Background transfers stopped.", flush=True)
                 return
+            read_interrupted = False
             try:
+                # Confirm local library access before advertising transfer availability.
+                if next_sync == 0:
+                    next_sync = await refresh_metadata()
                 batch = await asyncio.to_thread(client.request, "GET", "/api/companion/transfers")
                 if not isinstance(batch.get("transfers"), list):
                     raise CompanionError("Invalid transfer response. Update the Mac companion.")
@@ -251,11 +263,11 @@ async def _serve_transfers(*, minutes, path, background):
                             print("Skipped an invalid or expired transfer request.", flush=True)
                         del tasks[key]
                 if now >= next_sync:
-                    result = await asyncio.to_thread(sync, path, library, client,
-                                                     skip_unchanged=background, quiet=background)
-                    if background and result["changed"]:
-                        print(f"Updated library metadata for {result['books']} books.", flush=True)
-                    next_sync = time.monotonic() + 60
+                    next_sync = await refresh_metadata()
+            except InterruptedError:
+                # Keep this process's permission and active transfers after transient local EINTR.
+                read_interrupted = True
+                print("Apple Books read was interrupted; retrying in 20 seconds.", flush=True)
             except CompanionError as error:
                 if error.status in (401, 403):
                     if background:
@@ -266,7 +278,7 @@ async def _serve_transfers(*, minutes, path, background):
                     print("Sync connection interrupted; the companion will retry automatically.", flush=True)
                 connection_warning = True
                 connected = False
-            interval = IDLE_POLL_SECONDS if background and not tasks else POLL_SECONDS
+            interval = IDLE_POLL_SECONDS if read_interrupted or (background and not tasks) else POLL_SECONDS
             await asyncio.sleep(min(interval, max(0, deadline - time.monotonic())))
     finally:
         for task in tasks.values():

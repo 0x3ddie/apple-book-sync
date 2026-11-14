@@ -1,2 +1,5 @@
 # Direct EPUB transfer is optional; metadata-only companion commands stay stdlib-only.
 aiortc==1.16.0
+# Native folder selection for the optional macOS background setup.
+pyobjc-core==13.0; sys_platform == "darwin"
+pyobjc-framework-Cocoa==13.0; sys_platform == "darwin"

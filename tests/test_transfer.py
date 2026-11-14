@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import errno
 import hashlib
 import io
 import json
@@ -133,7 +134,8 @@ class TransferServiceTest(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch("transfer.SyncClient", return_value=self.client))
         self.library = self.enterContext(patch("transfer.BooksLibrary")).return_value
         self.enterContext(patch("transfer.sync", self.metadata_sync))
-        self.enterContext(contextlib.redirect_stdout(io.StringIO()))
+        self.output = io.StringIO()
+        self.enterContext(contextlib.redirect_stdout(self.output))
 
     def test_service_lock_blocks_a_duplicate_and_releases_after_error(self):
         with self.assertRaisesRegex(RuntimeError, "simulated stop"):
@@ -180,6 +182,71 @@ class TransferServiceTest(unittest.IsolatedAsyncioTestCase):
                 # Clean shutdown also releases the sender lock.
                 with service_lock(self.path):
                     pass
+
+    async def test_initial_interrupted_read_retries_before_heartbeat_or_ready(self):
+        attempts = []
+
+        def metadata(*args, **kwargs):
+            attempts.append(self.clock)
+            self.client.request.assert_not_called()
+            self.assertNotIn("Ready for direct transfers", self.output.getvalue())
+            if len(attempts) == 1:
+                raise InterruptedError(errno.EINTR, "Interrupted system call")
+            return {"changed": False, "books": 1}
+
+        self.metadata_sync.side_effect = metadata
+        self.client.request.side_effect = [{"transfers": []}, CompanionError("Unlinked", status=401)]
+        await serve_transfers(path=self.path, background=True)
+        self.assertEqual(attempts, [0, 20])
+        self.assertEqual(self.waits, [20, 20])
+        self.assertIn("Background companion connected. Ready for direct transfers", self.output.getvalue())
+
+    async def test_periodic_interrupted_read_keeps_active_transfer_and_retries_in_process(self):
+        started = asyncio.Event()
+        stopped = asyncio.Event()
+        attempts = []
+        heartbeats = []
+
+        async def pending_transfer(*args):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+
+        def metadata(*args, **kwargs):
+            attempts.append(self.clock)
+            if len(attempts) == 2:
+                raise InterruptedError(errno.EINTR, "Interrupted system call")
+            if len(attempts) == 3:
+                self.assertTrue(started.is_set())
+                self.assertFalse(stopped.is_set())
+            return {"changed": False, "books": 1}
+
+        def heartbeat(*args):
+            heartbeats.append(self.clock)
+            if self.clock >= 85:
+                raise CompanionError("Unlinked", status=401)
+            return {"transfers": [{"id": "active-transfer"}]}
+
+        self.metadata_sync.side_effect = metadata
+        self.client.request.side_effect = heartbeat
+        with patch("transfer.serve_offer", side_effect=pending_transfer) as offer:
+            await serve_transfers(path=self.path, background=True)
+        self.assertEqual(attempts, [0, 60, 80])
+        self.assertEqual(self.waits, [5] * 12 + [20, 5])
+        self.assertIn(60, heartbeats)
+        self.assertIn(80, heartbeats)
+        offer.assert_called_once()
+        self.assertTrue(stopped.is_set())
+
+    async def test_permission_denial_does_not_advertise_readiness_or_retry_as_interruption(self):
+        self.metadata_sync.side_effect = PermissionError(errno.EPERM, "Operation not permitted")
+        with self.assertRaises(PermissionError):
+            await serve_transfers(path=self.path, background=True)
+        self.client.request.assert_not_called()
+        self.assertNotIn("Ready for direct transfers", self.output.getvalue())
+        self.assertEqual(self.waits, [])
 
     async def test_foreground_window_remains_bounded(self):
         await serve_transfers(minutes=1, path=self.path)

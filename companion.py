@@ -317,8 +317,10 @@ def main():
             try:
                 import asyncio
                 from transfer import serve_transfers
+                from mac_permissions import restore_folder_access
             except ImportError:
                 raise CompanionError("Run ./scripts/start-transfers.sh to install the direct-transfer dependencies.") from None
+            restore_folder_access()
             asyncio.run(serve_transfers(minutes=arguments.minutes, background=arguments.background))
         elif arguments.command == "status":
             config = read_config()
