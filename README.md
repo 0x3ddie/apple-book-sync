@@ -94,7 +94,9 @@ python3 background.py status
 
 This copies the required companion files and Python environment into `~/Library/Application Support/Apple Books Companion`, installs a per-user macOS LaunchAgent, and starts the companion immediately. It starts again when you log into this Mac and restarts after failures. No Terminal window needs to remain open, and the installed service does not depend on the original checkout staying in place. Run `python3 background.py install` again from an updated checkout to refresh the installed copy; pairing and saved progress are kept. The background process checks local library metadata once a minute and uploads it only when it changes. It polls for transfers every 20 seconds while idle and every 5 seconds during a transfer.
 
-For new downloads, keep the Mac awake, logged in, and online, with the phone on the same Wi-Fi. On its first background launch, macOS may ask to let **Python** access data from other apps; allow that request so the companion can read Apple Books. Permission granted to Terminal or a development app does not automatically cover the background process. Logs are in `~/Library/Application Support/Apple Books Companion/.local/companion-background.log`. To stop it and remove automatic startup:
+For new downloads, keep the Mac awake, logged in, and online, with the phone on the same Wi-Fi. macOS may ask to let **Python** access data from other apps; allow that request so the companion can read Apple Books. This permission lasts only for the process lifetime, so the prompt can return after login or an automatic restart. Unattended reading after restarts requires a persistent access grant, which this installer does not configure. Permission granted to Terminal or a development app does not automatically cover the background process. [Apple's app-data permission explanation](https://developer.apple.com/videos/play/wwdc2023/10053/?time=1203)
+
+Logs are in `~/Library/Application Support/Apple Books Companion/.local/companion-background.log`. To stop it and remove automatic startup:
 
 ```sh
 python3 background.py uninstall
