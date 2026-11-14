@@ -1,0 +1,21 @@
+{
+  "name": "epub-share-one-book-test",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Local Apple Books EPUB position handoff experiment",
+  "scripts": {
+    "build": "node scripts/build-cloud.mjs",
+    "test:cloud": "node --test cloud/tests/*.test.mjs",
+    "migrate:cloud": "node cloud/migrate.mjs"
+  },
+  "engines": { "node": ">=22" },
+  "dependencies": {
+    "better-auth": "1.7.23",
+    "epubjs": "0.3.93",
+    "jszip": "3.10.2",
+    "pg": "8.23.1"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.16"
+  }
+}

@@ -1,0 +1,9 @@
+.local
+.git
+.env*
+!.env.example
+*.py
+tests
+__pycache__
+node_modules
+dist

@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' blob: data:; script-src 'self'; style-src 'self' 'unsafe-inline' blob:; connect-src 'self' blob:; object-src 'none'; base-uri 'self'">
+  <meta name="theme-color" content="#f1f5f8">
+  <title>Your library</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script defer src="/vendor/jszip.min.js"></script>
+  <script defer src="/vendor/epub.js"></script>
+  <script defer src="/account.js"></script>
+  <script defer src="/offline.js"></script>
+  <script defer src="/reader.js"></script>
+</head>
+<body>
+  <section id="sign-in-view" class="sign-in-shell" aria-labelledby="sign-in-title">
+    <p class="app-name">Books, wherever</p>
+    <h1 id="sign-in-title">Your books. Your place.</h1>
+    <p class="sign-in-description">Sign in to your private library, then link your Mac. Books you save stay on this device.</p>
+    <form id="sign-in-form" hidden>
+      <label for="sign-in-email">Email address</label>
+      <input id="sign-in-email" type="email" autocomplete="email" required placeholder="you@example.com">
+      <button class="primary-button" id="send-sign-in" type="submit">Email me a sign-in link</button>
+    </form>
+    <p id="account-status" role="status">Checking your account…</p>
+    <p id="account-error" class="error-message" role="alert" hidden></p>
+    <button id="retry-account" class="quiet-button" type="button" hidden>Try again</button>
+  </section>
+  <main id="library-view" class="library-shell" hidden>
+    <div id="account-bar" class="account-bar" hidden><span id="account-email"></span><button id="manage-devices" class="quiet-button" type="button">Linked Macs</button><button id="sign-out" class="quiet-button" type="button">Sign out &amp; clear downloads</button></div>
+    <section id="devices-panel" class="devices-panel" aria-labelledby="devices-heading" hidden>
+      <div class="devices-heading"><h2 id="devices-heading">Your linked Macs</h2><button id="close-devices" class="quiet-button" type="button">Close</button></div>
+      <p>Link the Mac that has your Apple Books library. It shares your library list, highlights, and reading positions with your account. Linking a new Mac replaces the previous companion.</p>
+      <div id="device-list"></div>
+      <button id="create-pairing" class="primary-button" type="button">Create pairing code</button>
+      <div id="pairing-result" hidden><label for="pairing-token">Paste this code into your Mac companion</label><textarea id="pairing-token" readonly rows="2" spellcheck="false"></textarea><p id="pairing-expiry"></p><p>Only share it with your own Mac. This code links that Mac to your account.</p></div>
+      <p id="device-error" class="error-message" role="alert" hidden></p>
+    </section>
+    <header class="library-header">
+      <div><p class="app-name"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 5c-3-2-6-2-9-1v15c3-1 6-1 9 1m0-15c3-2 6-2 9-1v15c-3-1-6-1-9 1V5Z"/></svg> Books, wherever</p><h1>Your library</h1></div>
+      <button id="refresh" class="quiet-button" type="button">Refresh from Books</button>
+    </header>
+    <div class="library-meta"><p id="library-status" role="status">Reading your Apple Books library…</p><span class="local-label">Mac preview</span></div>
+    <p id="library-error" class="error-message" role="alert" hidden></p>
+    <div class="offline-summary"><div><h2>Take a few books with you</h2><p>Save your picks on this device before you leave.</p></div><p id="offline-status" role="status">Checking saved books…</p></div>
+    <section id="continue-section" class="continue-section" aria-labelledby="continue-heading" hidden>
+      <h2 id="continue-heading">Continue reading</h2>
+      <div id="continue-books" class="continue-books"></div>
+    </section>
+    <section aria-labelledby="shelf-heading" class="shelf-section">
+      <div class="shelf-toolbar">
+        <h2 id="shelf-heading" tabindex="-1">All books <span id="book-count"></span></h2>
+        <label class="search"><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span class="sr-only">Search books or authors</span><input id="search" type="search" placeholder="Search books or authors" autocomplete="off"></label>
+      </div>
+      <div class="shelf-filters" role="group" aria-label="Filter library">
+        <button type="button" data-filter="all" aria-pressed="true">All books</button>
+        <button type="button" data-filter="reading" aria-pressed="false">In progress</button>
+        <button type="button" data-filter="available" aria-pressed="false">Available on Mac</button>
+        <button type="button" data-filter="saved" aria-pressed="false">Saved on this device</button>
+      </div>
+      <div id="shelf" class="book-shelf" aria-label="Books"></div>
+      <p id="empty-library" class="empty-message" hidden></p>
+    </section>
+    <footer class="library-footer">Saved books and their highlights stay in this browser. Clearing site data removes downloads; your Apple Books originals stay safe. This Mac preview does not yet connect your phone or sync through Vercel.</footer>
+  </main>
+
+  <section id="reading-view" class="reading-view" aria-label="Book reader" hidden>
+    <header class="reader-header">
+      <button id="back-library" class="quiet-button" type="button"><span aria-hidden="true">‹</span> Library</button>
+      <div class="reader-title"><h1 id="book-title"></h1><p id="book-author"></p></div>
+      <button id="show-notes" class="quiet-button" type="button" aria-expanded="false" aria-controls="notes-panel">Notes <span id="note-count"></span></button>
+    </header>
+    <div class="reader-status-row"><p id="reader-status" role="status">Opening book…</p><button id="retry-save" class="text-button" type="button" hidden>Retry save</button></div>
+    <p id="reader-error" class="error-message reader-error" role="alert" hidden></p>
+    <div class="reading-body">
+      <div id="book-stage" class="book-stage"><div id="reader" aria-label="EPUB content"></div><p id="reader-loading" class="reader-loading" role="status">Opening your book…</p></div>
+      <aside id="notes-panel" class="notes-panel" aria-labelledby="notes-heading" hidden>
+        <div class="notes-header"><h2 id="notes-heading">Your notes</h2><button id="close-notes" class="quiet-button" type="button" aria-label="Close notes">×</button></div>
+        <p class="notes-description">Highlights and bookmarks from Apple Books.</p>
+        <div id="annotations"></div>
+      </aside>
+    </div>
+    <nav class="reader-pager" aria-label="Reading controls"><button id="previous" class="quiet-button" type="button" disabled aria-label="Previous page">‹ <span>Previous</span></button><p id="chapter-label">Loading chapter…</p><button id="next" class="quiet-button" type="button" disabled aria-label="Next page"><span>Next</span> ›</button></nav>
+    <footer class="reader-footer"><div><p id="save-detail">Reading positions stay separate for each book.</p><a id="open-apple" hidden>Open this position in Apple Books</a></div><button id="done-reading" class="primary-button" type="button" disabled>Done reading</button></footer>
+  </section>
+
+  <dialog id="position-dialog" aria-labelledby="position-title">
+    <form method="dialog"><button class="dialog-close quiet-button" value="cancel" aria-label="Cancel opening book">×</button></form>
+    <h2 id="position-title">Choose where to continue</h2><p id="position-description">Your reading position changed in more than one place. Choose the place you want to keep.</p>
+    <div id="position-choices" class="position-choices"></div>
+    <p class="dialog-footnote">Your choice changes this web reader. Updating Apple Books still needs a handoff on your Mac.</p>
+  </dialog>
+</body>
+</html>
