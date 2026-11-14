@@ -10,8 +10,37 @@ const state = {
   navigation: null, libraryRequest: 0, storageWarning: false,
   savedBooks: new Map(), coverUrls: new Map(), downloads: new Map(), bridgeOnline: true,
   offlineReady: false, syncingBackups: false,
-  accountReady: false,
+  accountReady: false, anchorCfi: null,
 };
+
+// Display preferences are per device, not per account, and hold no book data.
+const settingsKey = "books-reader-settings";
+const readerThemes = {
+  white: { bg: "#ffffff", fg: "#1d1d1f", link: "#b9530f" },
+  sepia: { bg: "#f6eedc", fg: "#3e3221", link: "#9a4a12" },
+  paper: { bg: "#f0efea", fg: "#2b2b2a", link: "#9a4a12" },
+  dusk: { bg: "#3a3a3c", fg: "#e2e2e6", link: "#ffb44d" },
+  night: { bg: "#000000", fg: "#c9c9ce", link: "#ff9f0a" },
+};
+const readerFonts = {
+  serif: '"Iowan Old Style", "Charter", "Georgia", "Noto Serif", serif',
+  sans: '-apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", Roboto, sans-serif',
+  original: null,
+};
+const textSizes = [70, 80, 90, 100, 110, 120, 135, 150, 175, 200];
+const darkScheme = matchMedia("(prefers-color-scheme: dark)");
+const readerSettings = (() => {
+  const defaults = { size: 100, theme: null, font: "serif" };
+  try {
+    const saved = JSON.parse(localStorage.getItem(settingsKey)) || {};
+    return {
+      size: textSizes.includes(saved.size) ? saved.size : defaults.size,
+      // No saved theme means "follow the system light or dark setting".
+      theme: Object.hasOwn(readerThemes, saved.theme) ? saved.theme : defaults.theme,
+      font: Object.hasOwn(readerFonts, saved.font) ? saved.font : defaults.font,
+    };
+  } catch { return defaults; }
+})();
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -67,17 +96,33 @@ function removeBackup(draft) {
   try { localStorage.removeItem(storagePrefix + draft.id); } catch { /* Saved on the server; cleanup can wait. */ }
 }
 
-function progressText(book) {
+function bookMeta(book) {
   const progress = Number(book.progress);
-  if (progress >= .99) return "Finished";
-  if (progress > 0) return `${Math.max(1, Math.round(progress * 100))}% in Apple Books`;
-  return "Start reading";
+  const meta = element("div", "book-meta");
+  if (progress >= .99) meta.append(element("p", "book-progress finished", "Finished"));
+  else if (progress > 0) {
+    const track = element("span", "progress-track");
+    const fill = element("span");
+    fill.style.width = `${Math.min(100, Math.max(0, progress * 100))}%`;
+    track.append(fill);
+    const label = element("p", "book-progress", `${Math.max(1, Math.round(progress * 100))}%`);
+    label.title = "Progress in Apple Books";
+    meta.append(track, label);
+  } else return null;
+  return meta;
+}
+
+function coverHue(text) {
+  let hash = 0;
+  for (const character of text) hash = (hash * 31 + character.codePointAt(0)) >>> 0;
+  return hash % 360;
 }
 
 function coverFor(book) {
   const cover = element("div", "cover");
   cover.setAttribute("aria-hidden", "true");
-  cover.append(element("span", "cover-title", book.title));
+  cover.style.setProperty("--cover-hue", coverHue(`${book.title}${book.author || ""}`));
+  cover.append(element("span", "cover-title", book.title), element("span", "cover-author", book.author || ""));
   const coverUrl = state.coverUrls.get(book.id) || (state.bridgeOnline ? book.coverUrl : null);
   if (coverUrl) {
     const image = element("img");
@@ -106,13 +151,8 @@ function bookButton(book, continuing = false) {
   const info = element("div", "book-info");
   info.append(element("h3", "", book.title), element("p", "book-author", book.author || "Unknown author"));
   if (readable) {
-    info.append(element("p", "book-progress", progressText(book)));
-    if (book.progress > 0) {
-      const track = element("span", "progress-track");
-      const fill = element("span");
-      fill.style.width = `${Math.min(100, Math.max(0, book.progress * 100))}%`;
-      track.append(fill); info.append(track);
-    }
+    const meta = bookMeta(book);
+    if (meta) info.append(meta);
     if (readBackup(book.id)) info.append(element("p", "pending-label", "Position saved on this device"));
     else if (book.syncState === "pending") info.append(element("p", "pending-label", "New web position saved"));
     else if (book.syncState === "conflict") info.append(element("p", "pending-label", "Choose your reading position"));
@@ -137,6 +177,7 @@ function shelfItem(book) {
   const action = element("button", "download-button", download ? download.saving ? "Saving on this device…" : "Cancel download" : saved ? "Remove download" : "Save offline");
   action.type = "button";
   action.id = `download-action-${book.id}`;
+  action.dataset.state = download ? "busy" : saved ? "saved" : "save";
   action.disabled = download?.saving || !download && (!state.offlineReady || !saved && !canDownload(book));
   action.setAttribute("aria-label", `${download ? "Cancel download of" : saved ? "Remove download of" : "Save offline:"} ${book.title}`);
   action.addEventListener("click", () => download ? download.controller.abort() : toggleDownload(book));
@@ -492,6 +533,7 @@ async function navigate(action) {
     await rendition.reportLocation();
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     if (state.rendition !== rendition || !state.currentCfi || before === state.currentCfi) return;
+    state.anchorCfi = state.currentCfi;
     const draft = markDraft(state.currentCfi, state.location?.start.href);
     saveDraft(draft).catch(() => {});
   })();
@@ -502,9 +544,102 @@ async function navigate(action) {
 }
 
 function keyNavigation(event) {
+  if (event.key === "Escape" && !el("settings-panel").hidden) { closeSettings(true); return; }
   if (!state.ready || event.altKey || event.ctrlKey || event.metaKey || /INPUT|TEXTAREA|SELECT/.test(event.target?.tagName)) return;
   if (event.key === "ArrowRight") { event.preventDefault(); navigate(() => turnPage(1)); }
   if (event.key === "ArrowLeft") { event.preventDefault(); navigate(() => turnPage(-1)); }
+}
+
+function activeTheme() {
+  return readerSettings.theme || (darkScheme.matches ? "night" : "white");
+}
+
+function readerCss() {
+  const theme = readerThemes[activeTheme()];
+  const font = readerFonts[readerSettings.font];
+  const base = matchMedia("(max-width:600px)").matches ? 110 : 115;
+  const fontRule = font ? `font-family: ${font} !important;` : "";
+  // Book stylesheets often hard-code black text or coloured boxes, which would
+  // vanish or clash on other themes, so text and boxes follow the theme.
+  return `
+html, body { background: ${theme.bg} !important; color: ${theme.fg} !important; }
+body { font-size: ${Math.round(base * readerSettings.size / 100)}% !important; line-height: 1.65 !important; ${fontRule} }
+p { line-height: 1.65 !important; }
+body *:not(a) { color: inherit !important; }
+body * { background-color: transparent !important; }
+a { color: ${theme.link} !important; }
+${font ? `p, div, span, li, blockquote, dd, dt, td, th, h1, h2, h3, h4, h5, h6 { ${fontRule} }` : ""}`;
+}
+
+function styleContents(contents) {
+  contents.addStylesheetCss(readerCss(), "reader-settings");
+}
+
+function syncThemeColor(color) {
+  for (const meta of document.querySelectorAll('meta[name="theme-color"]')) {
+    meta.dataset.libraryColor ??= meta.content;
+    meta.content = color || meta.dataset.libraryColor;
+  }
+}
+
+function renderSettings() {
+  const theme = activeTheme();
+  el("reading-view").dataset.theme = theme;
+  for (const input of document.querySelectorAll('input[name="reader-theme"]')) input.checked = input.value === theme;
+  for (const input of document.querySelectorAll('input[name="reader-font"]')) input.checked = input.value === readerSettings.font;
+  el("text-size").textContent = `${readerSettings.size}%`;
+  el("smaller-text").disabled = readerSettings.size === textSizes[0];
+  el("larger-text").disabled = readerSettings.size === textSizes.at(-1);
+  if (!el("reading-view").hidden) syncThemeColor(readerThemes[theme].bg);
+}
+
+let relayoutTimer = null;
+function applySettings({ reflow = false } = {}) {
+  try { localStorage.setItem(settingsKey, JSON.stringify(readerSettings)); } catch { /* Settings still apply to this visit. */ }
+  renderSettings();
+  if (!state.rendition) return;
+  for (const contents of state.rendition.getContents()) styleContents(contents);
+  if (reflow) {
+    // Rapid taps on the size buttons settle into one repagination.
+    clearTimeout(relayoutTimer);
+    relayoutTimer = setTimeout(relayout, 200);
+  }
+}
+
+async function relayout() {
+  const rendition = state.rendition;
+  if (!state.ready || !rendition) return;
+  while (state.navigation) await state.navigation.catch(() => {});
+  const target = state.anchorCfi || state.currentCfi;
+  if (state.rendition !== rendition || !state.ready || !target) return;
+  // Return to the passage the reader was on before the text reflowed.
+  // This is not a page turn, so it does not record a new reading position.
+  const operation = displayPosition(target).catch(() => {});
+  state.navigation = operation;
+  try { await operation; }
+  finally { if (state.navigation === operation) state.navigation = null; }
+}
+
+function openSettings() {
+  renderSettings();
+  el("settings-panel").hidden = false;
+  el("show-settings").setAttribute("aria-expanded", "true");
+  if (matchMedia("(max-width: 900px)").matches) closeNotes();
+  (document.querySelector('input[name="reader-theme"]:checked') || el("smaller-text")).focus({ preventScroll: true });
+}
+
+function closeSettings(returnFocus = false) {
+  if (el("settings-panel").hidden) return;
+  el("settings-panel").hidden = true;
+  el("show-settings").setAttribute("aria-expanded", "false");
+  if (returnFocus) el("show-settings").focus({ preventScroll: true });
+}
+
+function changeTextSize(step) {
+  const index = textSizes.indexOf(readerSettings.size) + step;
+  if (index < 0 || index >= textSizes.length) return;
+  readerSettings.size = textSizes[index];
+  applySettings({ reflow: true });
 }
 
 function showNotes(annotationId) {
@@ -555,7 +690,10 @@ async function importAnnotations(detail) {
 async function displayPosition(target) {
   const rendition = state.rendition;
   const section = state.epub.spine.get(target);
-  let view = rendition.views().find((item) => item.section.index === section?.index);
+  // EPUB.js Views.find() takes a section, not a callback, so search the
+  // displayed views directly. Waiting for "rendered" on a section that is
+  // already on screen would never resolve and lock navigation.
+  let view = section && (rendition.views().displayed?.() || []).find((item) => item.section.index === section.index);
   if (view) {
     await rendition.display(target);
   } else {
@@ -664,6 +802,7 @@ async function openBook(id) {
     state.saveQueue = Promise.resolve();
     el("library-view").hidden = true;
     el("reading-view").hidden = false;
+    renderSettings();
     el("reader-loading").hidden = false;
     el("book-title").textContent = detail.title;
     el("book-author").textContent = detail.author || "";
@@ -685,12 +824,13 @@ async function openBook(id) {
     state.epub = ePub();
     await state.epub.open(saved ? await saved.epub.arrayBuffer() : detail.epubUrl, saved ? "binary" : "epub");
     state.rendition = state.epub.renderTo("reader", { width: "100%", height: "100%", flow: "paginated", spread: "none", allowScriptedContent: false, allowPopups: false });
-    state.rendition.themes.default({ body: { "font-family": "Georgia, serif !important", color: "#263649 !important", "line-height": "1.65 !important" }, p: { "line-height": "1.65 !important" } });
-    state.rendition.themes.fontSize(matchMedia("(max-width:600px)").matches ? "110%" : "115%");
     state.rendition.on("relocated", updateLocation);
     state.rendition.on("displayError", (error) => showError("reader-error", `Couldn’t display this passage. ${error.message || error}`));
     state.rendition.on("keydown", keyNavigation);
     state.rendition.hooks.content.register((contents) => {
+      styleContents(contents);
+      // Taps inside the page never reach the outer document.
+      contents.document.addEventListener("pointerdown", () => closeSettings(), { passive: true });
       // EPUB.js has already queued internal-link navigation when this event fires.
       contents.on("linkClicked", (href) => navigate(() => displayPosition(state.epub.path.relative(href))));
       let touchStart;
@@ -706,6 +846,7 @@ async function openBook(id) {
     await state.epub.ready;
     await importAnnotations(detail);
     await displayPosition(position.cfi);
+    state.anchorCfi = position.cfi || state.currentCfi;
     state.ready = true;
     el("reader-loading").hidden = true;
     el("done-reading").disabled = false;
@@ -724,13 +865,16 @@ async function openBook(id) {
 
 function disposeReader() {
   state.ready = false;
+  clearTimeout(relayoutTimer);
+  closeSettings();
   state.rendition?.destroy();
   state.epub?.destroy();
   state.rendition = null; state.epub = null; state.detail = null;
-  state.currentCfi = null; state.location = null; state.draft = null;
+  state.currentCfi = null; state.location = null; state.draft = null; state.anchorCfi = null;
   el("reader").replaceChildren();
   el("reading-view").hidden = true;
   el("library-view").hidden = false;
+  syncThemeColor(null);
   document.title = "Your library";
 }
 
@@ -781,6 +925,7 @@ async function retrySave() {
   state.detail = detail;
   if (position.cfi && position.cfi !== state.currentCfi) {
     await displayPosition(position.cfi);
+    state.anchorCfi = position.cfi;
   }
   await saveDraft(markDraft(position.cfi || state.currentCfi, state.location?.start.href));
 }
@@ -796,8 +941,27 @@ el("previous").addEventListener("click", () => navigate(() => turnPage(-1)));
 el("next").addEventListener("click", () => navigate(() => turnPage(1)));
 el("back-library").addEventListener("click", finishReading);
 el("done-reading").addEventListener("click", finishReading);
-el("show-notes").addEventListener("click", () => el("notes-panel").hidden ? showNotes() : closeNotes());
+el("show-notes").addEventListener("click", () => {
+  if (!el("notes-panel").hidden) return closeNotes();
+  if (matchMedia("(max-width: 900px)").matches) closeSettings();
+  showNotes();
+});
 el("close-notes").addEventListener("click", closeNotes);
+el("show-settings").addEventListener("click", () => el("settings-panel").hidden ? openSettings() : closeSettings(true));
+el("smaller-text").addEventListener("click", () => changeTextSize(-1));
+el("larger-text").addEventListener("click", () => changeTextSize(1));
+for (const input of document.querySelectorAll('input[name="reader-theme"]')) input.addEventListener("change", () => {
+  readerSettings.theme = input.value;
+  applySettings();
+});
+for (const input of document.querySelectorAll('input[name="reader-font"]')) input.addEventListener("change", () => {
+  readerSettings.font = input.value;
+  applySettings({ reflow: true });
+});
+darkScheme.addEventListener("change", () => { if (!readerSettings.theme) applySettings(); });
+document.addEventListener("pointerdown", (event) => {
+  if (!el("settings-panel").hidden && !event.target.closest("#settings-panel, #show-settings")) closeSettings();
+});
 el("retry-save").addEventListener("click", () => retrySave().catch((error) => showError("reader-error", error.message)));
 document.addEventListener("keydown", keyNavigation);
 document.addEventListener("visibilitychange", () => {

@@ -4,7 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self' blob: data:; script-src 'self'; style-src 'self' 'unsafe-inline' blob:; connect-src 'self' blob:; object-src 'none'; base-uri 'self'">
-  <meta name="theme-color" content="#f1f5f8">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
   <title>Your library</title>
   <link rel="stylesheet" href="/styles.css">
   <script defer src="/vendor/jszip.min.js"></script>
@@ -16,12 +18,12 @@
 </head>
 <body>
   <section id="sign-in-view" class="sign-in-shell" aria-labelledby="sign-in-title">
-    <p class="app-name">Books, wherever</p>
+    <div class="app-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 6.5c-2.6-1.7-5.4-2-8-1.2v13c2.6-.8 5.4-.5 8 1.2m0-13c2.6-1.7 5.4-2 8-1.2v13c-2.6-.8-5.4-.5-8 1.2v-13Z"/></svg></div>
     <h1 id="sign-in-title">Your books. Your place.</h1>
     <p class="sign-in-description">Sign in to your private library, then link your Mac. Books you save stay on this device.</p>
     <form id="sign-in-form" hidden>
-      <label for="sign-in-email">Email address</label>
-      <input id="sign-in-email" type="email" autocomplete="email" required placeholder="you@example.com">
+      <label for="sign-in-email" class="sr-only">Email address</label>
+      <input id="sign-in-email" type="email" autocomplete="email" required placeholder="Email address">
       <button class="primary-button" id="send-sign-in" type="submit">Email me a sign-in link</button>
     </form>
     <p id="account-status" role="status">Checking your account…</p>
@@ -44,26 +46,26 @@
       <p id="device-error" class="error-message" role="alert" hidden></p>
     </section>
     <header class="library-header">
-      <div><p class="app-name"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 5c-3-2-6-2-9-1v15c3-1 6-1 9 1m0-15c3-2 6-2 9-1v15c-3-1-6-1-9 1V5Z"/></svg> Books, wherever</p><h1>Your library</h1></div>
+      <h1>Library</h1>
       <button id="refresh" class="quiet-button" type="button">Refresh from Books</button>
     </header>
     <div class="library-meta"><p id="library-status" role="status">Reading your Apple Books library…</p><span class="local-label">Mac preview</span></div>
     <p id="library-error" class="error-message" role="alert" hidden></p>
-    <div class="offline-summary"><div><h2>Take a few books with you</h2><p>Save your picks on this device before you leave. Keep your Mac awake with transfers running, on the same Wi-Fi.</p></div><p id="offline-status" role="status">Checking saved books…</p></div>
     <section id="continue-section" class="continue-section" aria-labelledby="continue-heading" hidden>
-      <h2 id="continue-heading">Continue reading</h2>
+      <h2 id="continue-heading">Continue Reading</h2>
       <div id="continue-books" class="continue-books"></div>
     </section>
+    <div class="offline-summary"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 19.5h14"/></svg><div><h2>Take a few books with you</h2><p>Save your picks on this device before you leave. Keep your Mac awake with transfers running, on the same Wi-Fi.</p></div><p id="offline-status" role="status">Checking saved books…</p></div>
     <section aria-labelledby="shelf-heading" class="shelf-section">
       <div class="shelf-toolbar">
-        <h2 id="shelf-heading" tabindex="-1">All books <span id="book-count"></span></h2>
-        <label class="search"><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span class="sr-only">Search books or authors</span><input id="search" type="search" placeholder="Search books or authors" autocomplete="off"></label>
+        <h2 id="shelf-heading" tabindex="-1">All Books <span id="book-count"></span></h2>
+        <label class="search"><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span class="sr-only">Search books or authors</span><input id="search" type="search" placeholder="Search" autocomplete="off"></label>
       </div>
       <div class="shelf-filters" role="group" aria-label="Filter library">
-        <button type="button" data-filter="all" aria-pressed="true">All books</button>
-        <button type="button" data-filter="reading" aria-pressed="false">In progress</button>
-        <button type="button" data-filter="available" aria-pressed="false">Available on Mac</button>
-        <button type="button" data-filter="saved" aria-pressed="false">Saved on this device</button>
+        <button type="button" data-filter="all" aria-pressed="true">All</button>
+        <button type="button" data-filter="reading" aria-pressed="false">Reading</button>
+        <button type="button" data-filter="available" aria-pressed="false">On Mac</button>
+        <button type="button" data-filter="saved" aria-pressed="false">Saved</button>
       </div>
       <div id="shelf" class="book-shelf" aria-label="Books"></div>
       <p id="empty-library" class="empty-message" hidden></p>
@@ -73,26 +75,49 @@
 
   <section id="reading-view" class="reading-view" aria-label="Book reader" hidden>
     <header class="reader-header">
-      <button id="back-library" class="quiet-button" type="button"><span aria-hidden="true">‹</span> Library</button>
+      <button id="back-library" class="quiet-button reader-back" type="button"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m14.5 5-7 7 7 7"/></svg> Library</button>
       <div class="reader-title"><h1 id="book-title"></h1><p id="book-author"></p></div>
-      <button id="show-notes" class="quiet-button" type="button" aria-expanded="false" aria-controls="notes-panel">Notes <span id="note-count"></span></button>
+      <div class="reader-tools">
+        <button id="show-notes" class="icon-button" type="button" aria-expanded="false" aria-controls="notes-panel"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M9 6.5h11M9 12h11M9 17.5h11"/><circle cx="4.5" cy="6.5" r="1"/><circle cx="4.5" cy="12" r="1"/><circle cx="4.5" cy="17.5" r="1"/></svg><span class="tool-label">Notes</span> <span id="note-count"></span></button>
+        <button id="show-settings" class="icon-button" type="button" aria-expanded="false" aria-controls="settings-panel" aria-label="Text and theme"><span class="aa-glyph" aria-hidden="true"><span>A</span>A</span></button>
+      </div>
     </header>
-    <div class="reader-status-row"><p id="reader-status" role="status">Opening book…</p><button id="retry-save" class="text-button" type="button" hidden>Retry save</button></div>
+    <section id="settings-panel" class="settings-panel" aria-label="Text and theme" hidden>
+      <div class="size-control" role="group" aria-label="Text size">
+        <button id="smaller-text" type="button" aria-label="Smaller text"><span class="size-glyph small" aria-hidden="true">A</span></button>
+        <output id="text-size" aria-live="polite" aria-label="Text size">100%</output>
+        <button id="larger-text" type="button" aria-label="Larger text"><span class="size-glyph large" aria-hidden="true">A</span></button>
+      </div>
+      <fieldset class="theme-choices">
+        <legend>Theme</legend>
+        <label class="theme-choice" data-swatch="white"><input type="radio" name="reader-theme" value="white"><span class="swatch" aria-hidden="true">Aa</span><span class="choice-name">White</span></label>
+        <label class="theme-choice" data-swatch="sepia"><input type="radio" name="reader-theme" value="sepia"><span class="swatch" aria-hidden="true">Aa</span><span class="choice-name">Sepia</span></label>
+        <label class="theme-choice" data-swatch="paper"><input type="radio" name="reader-theme" value="paper"><span class="swatch" aria-hidden="true">Aa</span><span class="choice-name">Paper</span></label>
+        <label class="theme-choice" data-swatch="dusk"><input type="radio" name="reader-theme" value="dusk"><span class="swatch" aria-hidden="true">Aa</span><span class="choice-name">Dusk</span></label>
+        <label class="theme-choice" data-swatch="night"><input type="radio" name="reader-theme" value="night"><span class="swatch" aria-hidden="true">Aa</span><span class="choice-name">Night</span></label>
+      </fieldset>
+      <fieldset class="font-choices">
+        <legend>Font</legend>
+        <label class="font-choice" data-font="serif"><input type="radio" name="reader-font" value="serif"><span>Serif</span></label>
+        <label class="font-choice" data-font="sans"><input type="radio" name="reader-font" value="sans"><span>Sans</span></label>
+        <label class="font-choice" data-font="original"><input type="radio" name="reader-font" value="original"><span>Book’s own</span></label>
+      </fieldset>
+    </section>
     <p id="reader-error" class="error-message reader-error" role="alert" hidden></p>
     <div class="reading-body">
       <div id="book-stage" class="book-stage"><div id="reader" aria-label="EPUB content"></div><p id="reader-loading" class="reader-loading" role="status">Opening your book…</p></div>
       <aside id="notes-panel" class="notes-panel" aria-labelledby="notes-heading" hidden>
-        <div class="notes-header"><h2 id="notes-heading">Your notes</h2><button id="close-notes" class="quiet-button" type="button" aria-label="Close notes">×</button></div>
+        <div class="notes-header"><h2 id="notes-heading">Your notes</h2><button id="close-notes" class="icon-button" type="button" aria-label="Close notes"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
         <p class="notes-description">Highlights and bookmarks from Apple Books.</p>
         <div id="annotations"></div>
       </aside>
     </div>
-    <nav class="reader-pager" aria-label="Reading controls"><button id="previous" class="quiet-button" type="button" disabled aria-label="Previous page">‹ <span>Previous</span></button><p id="chapter-label">Loading chapter…</p><button id="next" class="quiet-button" type="button" disabled aria-label="Next page"><span>Next</span> ›</button></nav>
-    <footer class="reader-footer"><div><p id="save-detail">Reading positions stay separate for each book.</p><a id="open-apple" hidden>Open this position in Apple Books</a></div><button id="done-reading" class="primary-button" type="button" disabled>Done reading</button></footer>
+    <nav class="reader-pager" aria-label="Reading controls"><button id="previous" class="icon-button" type="button" disabled aria-label="Previous page"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m14.5 5-7 7 7 7"/></svg></button><p id="chapter-label">Loading chapter…</p><button id="next" class="icon-button" type="button" disabled aria-label="Next page"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m9.5 5 7 7-7 7"/></svg></button></nav>
+    <footer class="reader-footer"><div class="reader-sync"><div class="reader-status-row"><p id="reader-status" role="status">Opening book…</p><button id="retry-save" class="text-button" type="button" hidden>Retry save</button></div><p id="save-detail">Reading positions stay separate for each book.</p><a id="open-apple" hidden>Open this position in Apple Books</a></div><button id="done-reading" class="primary-button" type="button" disabled>Done</button></footer>
   </section>
 
   <dialog id="position-dialog" aria-labelledby="position-title">
-    <form method="dialog"><button class="dialog-close quiet-button" value="cancel" aria-label="Cancel opening book">×</button></form>
+    <form method="dialog"><button class="dialog-close icon-button" value="cancel" aria-label="Cancel opening book"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button></form>
     <h2 id="position-title">Choose where to continue</h2><p id="position-description">Your reading position changed in more than one place. Choose the place you want to keep.</p>
     <div id="position-choices" class="position-choices"></div>
     <p class="dialog-footnote">Your choice changes this web reader. Updating Apple Books still needs a handoff on your Mac.</p>
