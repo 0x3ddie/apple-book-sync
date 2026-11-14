@@ -2,6 +2,8 @@
 
 A browser bookshelf with a local Apple Books bridge and an optional private cloud metadata service. Keep using Books on Apple devices, choose EPUBs to save in the browser, and keep a separate web reading position for each book.
 
+Hosted preview: [apple-book-sync.vercel.app](https://apple-book-sync.vercel.app/). The Vercel deployment is live and its Neon database has been provisioned. Email delivery and database migrations are still pending, so sign-in currently stays closed with HTTP 503.
+
 ## What works locally
 
 - A searchable library with real covers where available, Continue reading, and reading/availability filters.
@@ -13,7 +15,7 @@ A browser bookshelf with a local Apple Books bridge and an optional private clou
 - Page turns save automatically. Done reading waits for a save before returning to the library. Unsent positions have a browser-local backup; hiding/leaving the page also attempts a keepalive save.
 - Changes in both Books and the web reader prompt a position choice. Per-book revisions and session sequences protect against stale requests and competing tabs.
 
-**Saving in the web reader does not update Apple Books automatically.** The manual Open this position in Apple Books link works on the Mac. Automatic position application, direct EPUB transfer to Android, and iPad propagation are not implemented or verified. The Python preview binds only to `127.0.0.1`; the preview itself is not phone-accessible. Cloud account and metadata APIs are implemented and tested but have not been configured or deployed.
+**Saving in the web reader does not update Apple Books automatically.** The manual Open this position in Apple Books link works on the Mac. Automatic position application, direct EPUB transfer to Android, and iPad propagation are not implemented or verified. The Python preview binds only to `127.0.0.1`; the local preview itself is not phone-accessible. Cloud account and metadata APIs are deployed, but live sign-in and sync still need email configuration and database migrations.
 
 Only downloaded, readable, DRM-free EPUBs can open. iCloud placeholders appear in the library with instructions to download them in Books first; listing the library does not intentionally hydrate cloud files. Annotations are imported read-only. Changes made here are not written into Apple’s databases.
 
@@ -42,7 +44,7 @@ To configure a deployment:
 2. Run `npm run migrate:cloud` with those environment variables available. For a local ignored `.env` file, use `node --env-file=.env cloud/migrate.mjs`. Migrations create the Better Auth and Books tables; they do not send emails.
 3. Deploy using the included `vercel.json`. `npm run build` copies an explicit allowlist of public reader files and vendor scripts into `dist/`. The Vercel function in `api/[...path].mjs` serves cloud metadata; the Python bridge is excluded. Missing configuration leaves all cloud endpoints closed with HTTP 503.
 
-No live delivery or Vercel deployment has been verified. Tests capture emails in memory. The Vercel connection currently needs team authorization before resources can be inspected or configured.
+The Vercel deployment is live at [apple-book-sync.vercel.app](https://apple-book-sync.vercel.app/) with a provisioned Neon database. Live email delivery and migrations have not been completed or verified; current tests capture emails in memory. Until configuration is complete, HTTP 503 from sign-in is expected.
 
 ## Download and pair the Mac companion
 
@@ -58,10 +60,10 @@ python3 companion.py --help
 
 If you already cloned the repository, open its folder instead of cloning it again. Open Apple Books on the Mac with your library, and allow the terminal or host app to read Books data if macOS prompts.
 
-Once cloud sign-in is configured, sign in to the website, open **Linked Macs**, and create a pairing code. Replace `https://YOUR-DOMAIN` with the hosted website's address, then run:
+Once cloud sign-in is configured, sign in to [the website](https://apple-book-sync.vercel.app/), open **Linked Macs**, and create a pairing code. Then run:
 
 ```sh
-python3 companion.py pair --server https://YOUR-DOMAIN --name "My Mac"
+python3 companion.py pair --server https://apple-book-sync.vercel.app --name "My Mac"
 python3 companion.py sync
 ```
 
