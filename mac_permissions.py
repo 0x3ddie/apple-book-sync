@@ -135,7 +135,10 @@ def authorize_folders(path=ACCESS_FILE):
         while True:
             panel = AppKit.NSOpenPanel.openPanel()
             panel.setTitle_("Allow Apple Books library access" if index == 0 else "Allow Apple Books EPUB access")
-            panel.setMessage_(f"Select this exact folder so the companion can read your Books data:\n{expected}")
+            panel.setMessage_(
+                f"Allow this exact Books folder:\n{expected}\n\n"
+                "If macOS opens your general Documents folder instead, press Command-Shift-G, "
+                "paste the path above, and press Return. Then choose Allow this folder without opening a subfolder.")
             panel.setPrompt_("Allow this folder")
             panel.setCanChooseDirectories_(True)
             panel.setCanChooseFiles_(False)
@@ -149,7 +152,10 @@ def authorize_folders(path=ACCESS_FILE):
                 break
             alert = AppKit.NSAlert.alloc().init()
             alert.setMessageText_("Select the Apple Books folder shown")
-            alert.setInformativeText_(f"This companion only accepts:\n{expected}\n\nChoose Try Again to return to that folder.")
+            alert.setInformativeText_(
+                f"This companion only accepts:\n{expected}\n\n"
+                "Choose Try Again, press Command-Shift-G, and paste this exact path. "
+                "Choose Allow this folder without opening a subfolder.")
             alert.addButtonWithTitle_("Try Again")
             alert.addButtonWithTitle_("Cancel")
             if alert.runModal() != AppKit.NSAlertFirstButtonReturn:
