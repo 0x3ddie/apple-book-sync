@@ -64,14 +64,19 @@ python3 companion.py --help
 
 If you already cloned the repository, open its folder instead of cloning it again. Open Apple Books on the Mac with your library, and allow the terminal or host app to read Books data if macOS prompts.
 
-After signing in to [the website](https://apple-book-sync.vercel.app/), open **Linked Macs** and create a pairing code. Then run:
+On the Mac, run:
 
 ```sh
 python3 companion.py pair --server https://apple-book-sync.vercel.app --name "My Mac"
-python3 companion.py sync
 ```
 
-Paste the pairing code at the hidden terminal prompt. It expires after ten minutes and can be used once. One Mac companion is active per account in this version; linking a replacement revokes the previous credential. The website shows registered Macs and their last contact time—it does not silently detect installations.
+Terminal shows a six-digit code such as `123 456`. On your phone, sign in to [the website](https://apple-book-sync.vercel.app/), open **Linked Macs**, and enter that code. Keep Terminal open: when the phone claims the code, the Mac displays the account email and asks you to type **yes** to confirm. Press Enter or type **no** if it is not your account. No library data is uploaded during pairing, and credentials are saved only after you approve the displayed account.
+
+The code expires after five minutes and can be used once. One Mac companion is active per account in this version; approving a replacement revokes the previous credential. The website shows registered Macs and their last contact time—it does not silently detect installations. After pairing, upload the library metadata with:
+
+```sh
+python3 companion.py sync
+```
 
 `sync` performs one outbound metadata sync. It uploads titles, identifiers, saved Apple positions, and annotations, then checks pending web positions. It does not upload EPUBs/covers, modify Books, or open external URLs. Credentials are stored in `~/Library/Application Support/Apple Books Companion/.local/companion.json` with permissions `0600`; this prototype does not yet use Keychain. Existing checkout-local credentials migrate there on the next companion command or background installation. Use `python3 companion.py status` to see the pairing, and **Unlink** on the website to revoke access. `python3 companion.py unpair` removes the local credential only.
 
@@ -155,7 +160,7 @@ Books saved a page-aligned position rather than the browser’s exact character 
 python3 -m unittest discover -s tests -v
 python3 -m py_compile library.py serve.py prepare.py companion.py transfer.py background.py
 node --check public/reader.js
-node --test tests/transfer.test.mjs
+node --test tests/*.test.mjs
 npm run test:cloud
 npm run build
 ```

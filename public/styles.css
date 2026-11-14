@@ -25,8 +25,12 @@
 .devices-heading,.device-row { display:flex; align-items:center; justify-content:space-between; gap:12px; }
 .device-row { border-bottom:1px solid var(--line); margin:12px 0; }
 .device-row p { overflow-wrap:anywhere; }
-#pairing-result { margin-top:20px; }
-#pairing-token { display:block; width:100%; margin-top:10px; padding:12px; border:1px solid var(--line); border-radius:8px; font:14px monospace; resize:none; }
+#pairing-form { margin-top:24px; }
+#pairing-form label { font-weight:600; }
+.pairing-entry { display:flex; flex-wrap:wrap; align-items:center; gap:12px; }
+#pairing-code { width:210px; max-width:100%; padding:12px; border:1px solid var(--line); border-radius:8px; font:28px ui-monospace,monospace; letter-spacing:.12em; color:var(--ink); background:var(--paper); }
+#pairing-code:focus { outline:2px solid var(--blue); outline-offset:2px; }
+#pairing-status { color:var(--ink); }
 * {
   box-sizing:border-box;
 }

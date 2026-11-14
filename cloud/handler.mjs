@@ -30,7 +30,10 @@ export function createHandler({ store, auth, origin }) {
       if (url.origin !== origin) throw new HttpError(403, 'Unrecognized application origin.');
       const path = url.pathname;
       const method = request.method;
-      const nativeRoute = path === '/api/devices/claim' || path.startsWith('/api/companion/');
+      const nativePairing = path.match(/^\/api\/devices\/pairing\/(start|poll|complete)$/);
+      const nativeRoute = !!nativePairing || path.startsWith('/api/companion/');
+      // api/index.mjs replaces this header with Vercel's trusted client address.
+      const clientIP = request.headers.get('x-books-client-ip') || 'unknown';
       if (!['GET', 'POST'].includes(method)) throw new HttpError(405, 'Method not allowed.');
       if (nativeRoute && request.headers.has('origin')) throw new HttpError(403, 'Use the Mac companion to make this request.');
       if (method === 'POST' && !nativeRoute && request.headers.get('origin') !== origin) {
@@ -45,12 +48,21 @@ export function createHandler({ store, auth, origin }) {
         return privateResponse(await auth.handler(request));
       }
 
-      if (path === '/api/devices/claim' && method === 'POST') {
+      if (nativePairing) {
+        if (method !== 'POST') throw new HttpError(405, 'Use POST for Mac pairing.');
         const body = await jsonBody(request);
-        fields(body, ['token', 'name'], 'pairing');
-        string(body.token, 60, 'pairing code', { pattern: /^pair_[A-Za-z0-9_-]{43}$/ });
-        string(body.name, 100, 'device name');
-        return reply(200, await store.claimPairing(body.token, body.name));
+        if (nativePairing[1] === 'start') {
+          fields(body, ['name'], 'pairing');
+          const name = string(body.name, 100, 'device name').trim();
+          if (!name) throw new HttpError(400, 'Choose a name for this Mac.');
+          return reply(200, await store.startPairing(name, clientIP));
+        }
+        fields(body, nativePairing[1] === 'poll' ? ['secret'] : ['secret', 'accountId', 'approve'], 'pairing');
+        const secret = string(body.secret, 48, 'pairing secret', { pattern: /^pair_[A-Za-z0-9_-]{43}$/ });
+        if (nativePairing[1] === 'poll') return reply(200, await store.pollPairing(secret));
+        const accountId = identifier(body.accountId, 'account identifier');
+        if (typeof body.approve !== 'boolean') throw new HttpError(400, 'Confirm or reject this account on your Mac.');
+        return reply(200, await store.completePairing(secret, accountId, body.approve));
       }
 
       if (path.startsWith('/api/companion/')) {
@@ -81,7 +93,12 @@ export function createHandler({ store, auth, origin }) {
       }
       if (path === '/api/library' && method === 'GET') return reply(200, await store.library(owner));
       if (path === '/api/devices' && method === 'GET') return reply(200, await store.devices(owner));
-      if (path === '/api/devices/pairing' && method === 'POST') return reply(200, await store.createPairing(owner));
+      if (path === '/api/devices/pairing' && method === 'POST') {
+        const body = await jsonBody(request);
+        fields(body, ['code'], 'pairing');
+        const code = string(body.code, 6, 'six-digit pairing code', { pattern: /^\d{6}$/ });
+        return reply(200, await store.claimPairing(owner, code, clientIP));
+      }
       if (path === '/api/transfers' && method === 'POST') return reply(200, await store.createTransfer(owner, transferRequest(await jsonBody(request, 40_960))));
       const transferMatch = path.match(/^\/api\/transfers\/([^/]+)(?:\/(close))?$/);
       if (transferMatch) {

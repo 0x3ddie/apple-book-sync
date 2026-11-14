@@ -2,11 +2,11 @@
 
 import argparse
 import fcntl
-import getpass
 import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import stat
 import sys
@@ -14,6 +14,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from contextlib import contextmanager
 from urllib.parse import urlsplit
@@ -27,6 +28,7 @@ LEGACY_CONFIG = Path(__file__).resolve().parent / ".local/companion.json"
 MAX_BODY = 1024 * 1024
 MAX_BOOKS = 200
 MAX_SEQUENCE = 9007199254740991
+PAIRING_SECONDS = 5 * 60
 
 
 class CompanionError(Exception):
@@ -226,28 +228,103 @@ def snapshot_batches(books):
     return batches
 
 
+def pairing_expiry(value):
+    try:
+        if not isinstance(value, str) or len(value) > 64:
+            raise ValueError
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError
+        return parsed.timestamp()
+    except (ValueError, OverflowError, OSError):
+        raise CompanionError("The sync service returned an invalid pairing expiry. Try pairing again.") from None
+
+
+def pairing_account(value):
+    if not isinstance(value, dict):
+        raise CompanionError("The sync service returned an invalid pairing account.")
+    identifier, email = value.get("id"), value.get("email")
+    if (not isinstance(identifier, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", identifier)
+            or not isinstance(email, str) or not 3 <= len(email) <= 320
+            or not email.isprintable() or not re.fullmatch(r"[^@\s]+@[^@\s]+", email)):
+        raise CompanionError("The sync service returned an invalid pairing account.")
+    return identifier, email
+
+
 def pair(server, name, allow_local_http=False, path=CONFIG):
     server = server_origin(server, allow_local_http)
-    if Path(path).exists():
+    path = Path(path)
+    if path.exists() or path.is_symlink():
         raise CompanionError("This Mac already has a pairing. Unpair locally before replacing it; revoke the old device on the website.")
-    if not isinstance(name, str) or not 1 <= len(name.strip()) <= 100:
+    if not isinstance(name, str) or not 1 <= len(name.strip()) <= 100 or not name.isprintable():
         raise CompanionError("Choose a device name between 1 and 100 characters.")
     if not sys.stdin.isatty():
-        raise CompanionError("Run pairing in a terminal so its token can be entered without echoing.")
-    token = getpass.getpass("Pairing token from the website (hidden): ").strip()
-    if not 16 <= len(token) <= 1024:
-        raise CompanionError("The pairing token is invalid. Copy a fresh token from the website.")
-    result = SyncClient(server, allow_local_http=allow_local_http).request("POST", "/api/devices/claim", {"token": token, "name": name.strip()})
+        raise CompanionError("Run pairing in a terminal so you can confirm the account on this Mac.")
+    client = SyncClient(server, allow_local_http=allow_local_http)
+    started = client.request("POST", "/api/devices/pairing/start", {"name": name.strip()})
+    code, secret, interval = started.get("code"), started.get("secret"), started.get("interval")
+    if (not isinstance(code, str) or not re.fullmatch(r"[0-9]{6}", code)
+            or not isinstance(secret, str) or not re.fullmatch(r"pair_[A-Za-z0-9_-]{43}", secret)
+            or type(interval) is not int or not 3 <= interval <= 30):
+        raise CompanionError("The sync service returned invalid pairing details. Try pairing again.")
+    expiry = pairing_expiry(started.get("expiresAt"))
+    remaining = expiry - time.time()
+    if not 0 < remaining <= PAIRING_SECONDS + 30:
+        raise CompanionError("The pairing code has an invalid or expired lifetime. Try pairing again.")
+    deadline = time.monotonic() + min(remaining, PAIRING_SECONDS)
+    print(f"Pairing code: {code[:3]} {code[3:]}", flush=True)
+    print(f"On your phone, sign in at {server}, open Linked Macs, and enter this code.", flush=True)
+    print("The code expires in five minutes. Keep this Terminal open to confirm your account.", flush=True)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise CompanionError("The pairing code expired. Run the pair command again for a new code.")
+        time.sleep(min(interval, remaining))
+        if time.monotonic() >= deadline:
+            raise CompanionError("The pairing code expired. Run the pair command again for a new code.")
+        try:
+            status = client.request("POST", "/api/devices/pairing/poll", {"secret": secret})
+        except CompanionError as error:
+            if error.status == 429:
+                continue  # Respect the advertised interval before trying again.
+            if error.status == 401:
+                raise CompanionError("The pairing code expired or was cancelled. Run the pair command again.") from None
+            raise
+        if time.monotonic() >= deadline:
+            raise CompanionError("The pairing code expired. Run the pair command again for a new code.")
+        if pairing_expiry(status.get("expiresAt")) != expiry or status.get("status") not in ("pending", "claimed"):
+            raise CompanionError("The sync service returned an invalid pairing status. Try pairing again.")
+        if status["status"] == "claimed":
+            account_id, email = pairing_account(status.get("account"))
+            break
+    print(f"\nAccount requesting this Mac: {email}", flush=True)
+    print("Confirm this is your account before sharing your Books library.", flush=True)
+    try:
+        approve = input("Link this Mac to that account? Type yes to approve [yes/No]: ").strip().lower() == "yes"
+    except EOFError:
+        approve = False
+    if time.monotonic() >= deadline:
+        raise CompanionError("The pairing code expired before confirmation. Run the pair command again.")
+    if path.exists() or path.is_symlink():
+        raise CompanionError("This Mac was paired while waiting. Its existing pairing was kept.")
+    result = client.request("POST", "/api/devices/pairing/complete",
+                            {"secret": secret, "accountId": account_id, "approve": approve})
+    if not approve:
+        if result.get("ok") is not True:
+            raise CompanionError("The sync service did not confirm cancellation. No local pairing was saved.")
+        print("Pairing cancelled. No library data was sent.", flush=True)
+        return False
     device, credential = result.get("device"), result.get("credential")
-    if not isinstance(device, dict) or not isinstance(device.get("id"), str) or not device["id"]:
+    if (not isinstance(device, dict) or not isinstance(device.get("id"), str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", device["id"])):
         raise CompanionError("The sync service did not return a device identifier.")
-    SyncClient(server, credential, allow_local_http)
-    if credential is None:
+    if not isinstance(credential, str) or not re.fullmatch(r"device_[A-Za-z0-9_-]{43}", credential):
         raise CompanionError("The sync service did not return a device credential.")
     config = {"server": server, "deviceId": device["id"], "name": name.strip(),
               "credential": credential, "sequence": 0, "allowLocalHttp": allow_local_http}
     write_config(config, path)
     print(f"Mac paired. Device credential saved in {path} with permissions 0600 (not Keychain).")
+    return True
 
 
 def sync(path=CONFIG, library=None, client=None, *, skip_unchanged=False, quiet=False):
@@ -292,7 +369,7 @@ def _sync(path, library=None, client=None, *, skip_unchanged=False, quiet=False)
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    pairing = commands.add_parser("pair", help="Pair using a token shown on your signed-in website")
+    pairing = commands.add_parser("pair", help="Show a six-digit code to enter on your signed-in phone")
     pairing.add_argument("--server", required=True, help="The HTTPS origin of your sync website")
     pairing.add_argument("--name", default="Mac companion")
     pairing.add_argument("--allow-local-http", action="store_true", help="Development only: permit http://127.0.0.1")
@@ -334,7 +411,8 @@ def main():
         print(f"Companion: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print("\nTransfers stopped. Books already saved on your phone remain available offline.")
+        print("\nPairing stopped. No library data was sent." if arguments.command == "pair" else
+              "\nTransfers stopped. Books already saved on your phone remain available offline.")
         return 0
     return 0
 

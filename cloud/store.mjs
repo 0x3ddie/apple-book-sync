@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto';
 import { HttpError } from './validation.mjs';
 
 const hash = (value) => createHash('sha256').update(value).digest('hex');
@@ -37,7 +37,9 @@ function device(row, now = new Date()) {
 }
 
 export class PostgresStore {
-  constructor(pool, { now = () => new Date() } = {}) { this.pool = pool; this.now = now; }
+  constructor(pool, { now = () => new Date(), pairingCode = () => randomInt(1_000_000).toString().padStart(6, '0') } = {}) {
+    this.pool = pool; this.now = now; this.pairingCode = pairingCode;
+  }
 
   async transaction(action) {
     const client = await this.pool.connect();
@@ -96,32 +98,81 @@ export class PostgresStore {
     });
   }
 
-  async createPairing(owner) {
-    const token = `pair_${randomBytes(32).toString('base64url')}`;
-    const expiresAt = new Date(this.now().getTime() + 600_000);
-    await this.transaction(async (client) => {
-      // A new code replaces this account's unclaimed code.
-      await client.query('DELETE FROM books_pairings WHERE expires_at<=$1', [this.now()]);
-      await client.query(`INSERT INTO books_pairings (token_hash,owner_id,expires_at) VALUES ($1,$2,$3)
-        ON CONFLICT (owner_id) DO UPDATE SET token_hash=EXCLUDED.token_hash,expires_at=EXCLUDED.expires_at`, [hash(token), owner, expiresAt]);
-    });
-    return { token, expiresAt: expiresAt.toISOString() };
+  async pairingLimit(key, maximum, windowMs) {
+    const now = this.now();
+    // This statement commits independently: a failed code claim must still count.
+    await this.pool.query('DELETE FROM books_pairing_limits WHERE expires_at<=$1', [now]);
+    const { rows } = await this.pool.query(`INSERT INTO books_pairing_limits (key_hash,attempts,expires_at)
+      VALUES ($1,1,$2) ON CONFLICT (key_hash) DO UPDATE SET
+      attempts=CASE WHEN books_pairing_limits.expires_at<=$3 THEN 1 ELSE LEAST(books_pairing_limits.attempts+1,$4) END,
+      expires_at=CASE WHEN books_pairing_limits.expires_at<=$3 THEN EXCLUDED.expires_at ELSE books_pairing_limits.expires_at END
+      RETURNING attempts,expires_at`, [hash(key), new Date(now.getTime() + windowMs), now, maximum + 1]);
+    if (rows[0].attempts > maximum) {
+      throw new HttpError(429, 'Too many pairing attempts. Wait a few minutes and try again.',
+        { retryAfter: Math.max(1, Math.ceil((new Date(rows[0].expires_at).getTime() - now.getTime()) / 1000)) });
+    }
   }
 
-  async claimPairing(token, name) {
-    const credential = `device_${randomBytes(32).toString('base64url')}`;
+  async startPairing(name, ip) {
+    await this.pairingLimit(`start-ip:${ip}`, 10, 600_000);
+    const secret = `pair_${randomBytes(32).toString('base64url')}`;
+    const expiresAt = new Date(this.now().getTime() + 300_000);
     return this.transaction(async (client) => {
-      const pairing = await client.query('SELECT owner_id FROM books_pairings WHERE token_hash=$1 AND expires_at>$2', [hash(token), this.now()]);
-      if (!pairing.rows.length) throw new HttpError(401, 'Pairing code is invalid, expired, or already used.');
-      // Serialize replacement on the account before consuming the one-use code.
-      await client.query('SELECT id FROM "user" WHERE id=$1 FOR UPDATE', [pairing.rows[0].owner_id]);
-      const result = await client.query('DELETE FROM books_pairings WHERE token_hash=$1 AND expires_at>$2 RETURNING owner_id', [hash(token), this.now()]);
-      if (!result.rows.length) throw new HttpError(401, 'Pairing code is invalid, expired, or already used.');
-      await client.query('UPDATE books_devices SET revoked_at=$2 WHERE owner_id=$1 AND revoked_at IS NULL', [result.rows[0].owner_id, this.now()]);
-      await client.query('DELETE FROM books_transfers WHERE owner_id=$1', [result.rows[0].owner_id]);
-      const { rows } = await client.query(`INSERT INTO books_devices (id,owner_id,name,credential_hash,created_at)
-        VALUES ($1,$2,$3,$4,$5) RETURNING *`, [randomUUID(), result.rows[0].owner_id, name, hash(credential), this.now()]);
-      return { device: device(rows[0], this.now()), credential };
+      await client.query('DELETE FROM books_device_pairings WHERE expires_at<=$1', [this.now()]);
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const code = this.pairingCode();
+        const { rows } = await client.query(`INSERT INTO books_device_pairings (secret_hash,code_hash,device_id,name,expires_at)
+          VALUES ($1,$2,$3,$4,$5) ON CONFLICT (code_hash) DO NOTHING RETURNING device_id`,
+        [hash(secret), hash(code), randomUUID(), name, expiresAt]);
+        if (rows.length) return { code, secret, expiresAt: iso(expiresAt), interval: 3 };
+      }
+      throw new HttpError(503, 'Could not create a pairing code. Try again shortly.');
+    });
+  }
+
+  async claimPairing(owner, code, ip) {
+    await this.pairingLimit(`claim-ip:${ip}`, 20, 300_000);
+    await this.pairingLimit(`claim-owner:${owner}`, 5, 300_000);
+    const { rows } = await this.pool.query(`UPDATE books_device_pairings SET owner_id=$1
+      WHERE code_hash=$2 AND expires_at>$3 AND owner_id IS NULL RETURNING name,device_id,expires_at`,
+    [owner, hash(code), this.now()]);
+    if (!rows.length) throw new HttpError(400, 'Pairing code is invalid, expired, or already used.');
+    return { name: rows[0].name, deviceId: rows[0].device_id, expiresAt: iso(rows[0].expires_at), status: 'awaiting_mac' };
+  }
+
+  async pollPairing(secret) {
+    return this.transaction(async (client) => {
+      const { rows } = await client.query(`SELECT p.*,u.email FROM books_device_pairings p LEFT JOIN "user" u ON u.id=p.owner_id
+        WHERE p.secret_hash=$1 AND p.expires_at>$2 FOR UPDATE OF p`, [hash(secret), this.now()]);
+      if (!rows.length) throw new HttpError(401, 'Pairing expired or was already completed. Start again on your Mac.');
+      const row = rows[0], now = this.now();
+      if (new Date(row.expires_at) <= now) throw new HttpError(401, 'Pairing expired. Start again on your Mac.');
+      if (row.last_polled_at && new Date(row.last_polled_at).getTime() > now.getTime() - 3000) {
+        throw new HttpError(429, 'Wait before checking pairing again.', { retryAfter: 3 });
+      }
+      await client.query('UPDATE books_device_pairings SET last_polled_at=$2 WHERE secret_hash=$1', [hash(secret), now]);
+      return { status: row.owner_id ? 'claimed' : 'pending', expiresAt: iso(row.expires_at),
+        ...(row.owner_id ? { account: { id: row.owner_id, email: row.email } } : {}) };
+    });
+  }
+
+  async completePairing(secret, accountId, approve) {
+    return this.transaction(async (client) => {
+      const { rows } = await client.query('SELECT * FROM books_device_pairings WHERE secret_hash=$1 FOR UPDATE', [hash(secret)]);
+      const row = rows[0];
+      if (!row || new Date(row.expires_at) <= this.now()) throw new HttpError(401, 'Pairing expired or was already completed. Start again on your Mac.');
+      if (!row.owner_id || row.owner_id !== accountId) throw new HttpError(409, 'The pairing account does not match. Check the account on your Mac again.');
+      // Serialize replacement with other devices and recheck expiry after waiting for the account lock.
+      await client.query('SELECT id FROM "user" WHERE id=$1 FOR UPDATE', [row.owner_id]);
+      if (new Date(row.expires_at) <= this.now()) throw new HttpError(401, 'Pairing expired. Start again on your Mac.');
+      await client.query('DELETE FROM books_device_pairings WHERE secret_hash=$1', [hash(secret)]);
+      if (!approve) return { ok: true };
+      const credential = `device_${randomBytes(32).toString('base64url')}`;
+      await client.query('UPDATE books_devices SET revoked_at=$2 WHERE owner_id=$1 AND revoked_at IS NULL', [row.owner_id, this.now()]);
+      await client.query('DELETE FROM books_transfers WHERE owner_id=$1', [row.owner_id]);
+      const result = await client.query(`INSERT INTO books_devices (id,owner_id,name,credential_hash,created_at)
+        VALUES ($1,$2,$3,$4,$5) RETURNING *`, [row.device_id, row.owner_id, row.name, hash(credential), this.now()]);
+      return { device: device(result.rows[0], this.now()), credential };
     });
   }
 

@@ -13,12 +13,24 @@ CREATE INDEX IF NOT EXISTS books_devices_owner ON books_devices(owner_id);
 CREATE UNIQUE INDEX IF NOT EXISTS books_devices_active_owner ON books_devices(owner_id) WHERE revoked_at IS NULL;
 ALTER TABLE books_devices ADD COLUMN IF NOT EXISTS transfer_seen_at timestamptz;
 
-CREATE TABLE IF NOT EXISTS books_pairings (
-  token_hash text PRIMARY KEY,
-  owner_id text NOT NULL UNIQUE REFERENCES "user"(id) ON DELETE CASCADE,
+-- The short code locates a pending Mac. Only its private secret can complete pairing.
+CREATE TABLE IF NOT EXISTS books_device_pairings (
+  secret_hash text PRIMARY KEY,
+  code_hash text NOT NULL UNIQUE,
+  device_id text NOT NULL UNIQUE,
+  name text NOT NULL,
+  owner_id text REFERENCES "user"(id) ON DELETE CASCADE,
+  expires_at timestamptz NOT NULL,
+  last_polled_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS books_device_pairings_expiry ON books_device_pairings(expires_at);
+
+CREATE TABLE IF NOT EXISTS books_pairing_limits (
+  key_hash text PRIMARY KEY,
+  attempts integer NOT NULL,
   expires_at timestamptz NOT NULL
 );
-CREATE INDEX IF NOT EXISTS books_pairings_expiry ON books_pairings(expires_at);
+CREATE INDEX IF NOT EXISTS books_pairing_limits_expiry ON books_pairing_limits(expires_at);
 
 CREATE TABLE IF NOT EXISTS books_library (
   owner_id text NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,

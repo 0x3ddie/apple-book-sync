@@ -34,8 +34,13 @@
       <div class="devices-heading"><h2 id="devices-heading">Your linked Macs</h2><button id="close-devices" class="quiet-button" type="button">Close</button></div>
       <p>Link the Mac that has your Apple Books library. It shares your library list, highlights, and reading positions with your account. Linking a new Mac replaces the previous companion.</p>
       <div id="device-list"></div>
-      <button id="create-pairing" class="primary-button" type="button">Create pairing code</button>
-      <div id="pairing-result" hidden><label for="pairing-token">Paste this code into your Mac companion</label><textarea id="pairing-token" readonly rows="2" spellcheck="false"></textarea><p id="pairing-expiry"></p><p>Only share it with your own Mac. This code links that Mac to your account.</p></div>
+      <form id="pairing-form">
+        <label for="pairing-code">Six-digit code from your Mac</label>
+        <p id="pairing-help">Start pairing in your Mac companion, then enter its code here. Codes last five minutes.</p>
+        <div class="pairing-entry"><input id="pairing-code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{3} ?[0-9]{3}" maxlength="7" placeholder="123 456" aria-describedby="pairing-help" required><button id="link-mac" class="primary-button" type="submit">Link Mac</button></div>
+      </form>
+      <p id="pairing-status" role="status" hidden></p>
+      <button id="reset-pairing" class="quiet-button" type="button" hidden>Use another code</button>
       <p id="device-error" class="error-message" role="alert" hidden></p>
     </section>
     <header class="library-header">

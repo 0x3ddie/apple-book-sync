@@ -6,7 +6,7 @@ window.ReaderAccount = (() => {
   const hintKey = "books-last-account";
   const revokedKey = "books-account-revoked";
   const get = (id) => document.getElementById(id);
-  let current, unlock;
+  let current, unlock, pairing, pairingTimer, deviceGeneration = 0;
   const ready = new Promise((resolve) => { unlock = resolve; });
 
   function errorAt(id, message) {
@@ -96,8 +96,9 @@ window.ReaderAccount = (() => {
   get("retry-account").addEventListener("click", checkSession);
 
   async function devices() {
-    errorAt("device-error", "");
+    const generation = deviceGeneration;
     const data = await request("/api/devices");
+    if (generation !== deviceGeneration) return [];
     const rows = data.devices.map((device) => {
       const row = document.createElement("div");
       row.className = "device-row";
@@ -117,27 +118,100 @@ window.ReaderAccount = (() => {
     });
     if (!rows.length) {
       const empty = document.createElement("p");
-      empty.textContent = "No Mac linked yet. Create a pairing code to connect yours.";
+      empty.textContent = "No Mac linked yet. Enter the six-digit code from your Mac to connect it.";
       rows.push(empty);
     }
     get("device-list").replaceChildren(...rows);
+    return data.devices;
+  }
+  function pairingStatus(message) {
+    get("pairing-status").textContent = message;
+    get("pairing-status").hidden = !message;
+  }
+  function resetPairing() {
+    deviceGeneration++;
+    clearTimeout(pairingTimer);
+    pairing = null;
+    get("pairing-code").disabled = false;
+    get("link-mac").disabled = false;
+    get("reset-pairing").hidden = true;
+  }
+  async function checkPairing(attempt) {
+    if (pairing !== attempt || get("devices-panel").hidden) return;
+    if (Date.now() >= attempt.expiresAt) {
+      resetPairing();
+      pairingStatus("The pairing window ended. If you already confirmed on your Mac, it will appear in the list. Otherwise, start pairing on your Mac for a new code.");
+      devices().catch((error) => errorAt("device-error", error.message));
+      return;
+    }
+    try {
+      const linked = await devices();
+      if (pairing !== attempt) return;
+      if (linked.some((device) => device.id === attempt.deviceId && !device.revokedAt)) {
+        resetPairing();
+        pairingStatus(`${attempt.name} is linked. Your Mac connection is saved.`);
+        errorAt("device-error", "");
+        get("refresh").click();
+        return;
+      }
+      errorAt("device-error", "");
+    } catch (error) {
+      if (pairing !== attempt) return;
+      errorAt("device-error", error.networkFailure ? "Waiting for a connection to check your Mac. Your pairing can still finish on the Mac." : error.message);
+    }
+    if (pairing === attempt && !get("devices-panel").hidden) pairingTimer = setTimeout(() => checkPairing(attempt), 4000);
   }
   get("manage-devices").addEventListener("click", () => {
     get("devices-panel").hidden = false;
-    devices().catch((error) => errorAt("device-error", error.message));
-  });
-  get("close-devices").addEventListener("click", () => { get("devices-panel").hidden = true; });
-  get("create-pairing").addEventListener("click", async () => {
-    get("create-pairing").disabled = true;
     errorAt("device-error", "");
-    try {
-      const result = await request("/api/devices/pairing", { method: "POST" });
-      get("pairing-token").value = result.token;
-      get("pairing-expiry").textContent = `Use once before ${new Date(result.expiresAt).toLocaleTimeString([], {hour:"numeric", minute:"2-digit"})}.`;
-      get("pairing-result").hidden = false;
-    } catch (error) { errorAt("device-error", error.message); }
-    finally { get("create-pairing").disabled = false; }
+    clearTimeout(pairingTimer);
+    if (pairing?.deviceId) checkPairing(pairing);
+    else devices().catch((error) => errorAt("device-error", error.message));
   });
+  get("close-devices").addEventListener("click", () => {
+    get("devices-panel").hidden = true;
+    clearTimeout(pairingTimer);
+  });
+  get("pairing-code").addEventListener("input", () => {
+    get("pairing-code").value = get("pairing-code").value.replace(/\s/g, "");
+  });
+  get("pairing-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (pairing) return;
+    const code = get("pairing-code").value.replace(/\s/g, "");
+    if (!/^[0-9]{6}$/.test(code)) { errorAt("device-error", "Enter the six digits shown on your Mac."); return; }
+    const attempt = {};
+    pairing = attempt;
+    get("link-mac").disabled = true;
+    get("pairing-code").disabled = true;
+    errorAt("device-error", "");
+    pairingStatus("Linking your Mac…");
+    try {
+      const result = await request("/api/devices/pairing", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code }),
+      });
+      if (pairing !== attempt) return;
+      attempt.deviceId = result.deviceId;
+      attempt.name = result.name;
+      attempt.expiresAt = Date.parse(result.expiresAt);
+      get("pairing-code").value = "";
+      pairingStatus(`One last step: confirm ${current.user.email} on ${result.name}. Keep the companion open until it says linked.`);
+      get("reset-pairing").hidden = false;
+      checkPairing(attempt);
+    } catch (error) {
+      if (pairing !== attempt) return;
+      resetPairing();
+      pairingStatus("");
+      errorAt("device-error", error.message);
+    }
+  });
+  get("reset-pairing").addEventListener("click", () => {
+    resetPairing();
+    pairingStatus("Cancel the previous attempt on your Mac, then start pairing again for a new code.");
+    errorAt("device-error", "");
+    get("pairing-code").focus();
+  });
+  window.addEventListener("books-account-changing", resetPairing);
 
   window.addEventListener("storage", async (event) => {
     if (!current || ![hintKey, revokedKey].includes(event.key)) return;

@@ -39,10 +39,10 @@ function postgresPool(db) {
   };
 }
 
-function request(path, { cookie, bearer, body, originHeader = origin, accountHeader, method, headers = {} } = {}) {
+function request(path, { cookie, bearer, body, originHeader = origin, accountHeader, method, headers = {}, ip = '203.0.113.7' } = {}) {
   method ??= body === undefined ? 'GET' : 'POST';
   const builtHeaders = new Headers(headers);
-  builtHeaders.set('x-books-client-ip', '203.0.113.7');
+  builtHeaders.set('x-books-client-ip', ip);
   if (cookie) builtHeaders.set('cookie', cookie);
   if (accountHeader !== null && (accountHeader ?? accounts.get(cookie))) builtHeaders.set('x-books-account', accountHeader ?? accounts.get(cookie));
   if (bearer) builtHeaders.set('authorization', `Bearer ${bearer}`);
@@ -56,12 +56,12 @@ async function call(path, options) {
   return { status: response.status, body: await response.json(), response };
 }
 
-async function login(email = 'alice@example.test') {
-  const sent = await call('/api/auth/sign-in/magic-link', { body: { email, callbackURL: '/' } });
+async function login(email = 'alice@example.test', ip = '203.0.113.7') {
+  const sent = await call('/api/auth/sign-in/magic-link', { body: { email, callbackURL: '/' }, ip });
   assert.equal(sent.status, 200, JSON.stringify(sent.body));
   const message = emails.at(-1);
   assert.equal(message.email, email);
-  const result = await handle(new Request(message.url, { headers: { 'x-books-client-ip': '203.0.113.7' } }));
+  const result = await handle(new Request(message.url, { headers: { 'x-books-client-ip': ip } }));
   assert.equal(result.status, 302);
   const sessionCookie = result.headers.getSetCookie().find((value) => value.includes('session_token='));
   assert.match(sessionCookie, /; Secure/i); assert.match(sessionCookie, /; HttpOnly/i); assert.match(sessionCookie, /; SameSite=Lax/i);
@@ -73,12 +73,24 @@ async function login(email = 'alice@example.test') {
   return { cookie, url: message.url, session };
 }
 
+const startPairing = (name = 'Test Mac', options = {}) => call('/api/devices/pairing/start', { originHeader: null, body: { name }, ...options });
+const pollPairing = (secret, options = {}) => call('/api/devices/pairing/poll', { originHeader: null, body: { secret }, ...options });
+const completePairing = (secret, accountId, approve = true, options = {}) => call('/api/devices/pairing/complete', {
+  originHeader: null, body: { secret, accountId, approve }, ...options,
+});
+const claimPairing = (cookie, code, options = {}) => call('/api/devices/pairing', { cookie, body: { code }, ...options });
+
 async function pair(cookie, name = 'Test Mac') {
-  const created = await call('/api/devices/pairing', { cookie, body: {} });
-  assert.equal(created.status, 200);
-  const claimed = await call('/api/devices/claim', { originHeader: null, body: { token: created.body.token, name } });
-  assert.equal(claimed.status, 200);
-  return { ...claimed.body, token: created.body.token };
+  const created = await startPairing(name);
+  assert.equal(created.status, 200, JSON.stringify(created.body));
+  const claimed = await claimPairing(cookie, created.body.code);
+  assert.equal(claimed.status, 200, JSON.stringify(claimed.body));
+  const pending = await pollPairing(created.body.secret);
+  assert.equal(pending.body.status, 'claimed');
+  const completed = await completePairing(created.body.secret, pending.body.account.id);
+  assert.equal(completed.status, 200, JSON.stringify(completed.body));
+  assert.equal(completed.body.device.id, claimed.body.deviceId);
+  return { ...completed.body, secret: created.body.secret, code: created.body.code };
 }
 
 const book = (overrides = {}) => ({
@@ -108,7 +120,7 @@ beforeEach(async () => {
   time = Date.parse('2026-11-14T00:00:00.000Z');
   emails.length = 0;
   accounts.clear();
-  await database.exec('TRUNCATE TABLE "user", "verification", "rateLimit" CASCADE');
+  await database.exec('TRUNCATE TABLE "user", "verification", "rateLimit", books_device_pairings, books_pairing_limits CASCADE');
 });
 after(async () => { await database?.close(); });
 
@@ -170,22 +182,163 @@ test('expired sessions clear the browser cookie while keeping the library privat
   assert.equal(result.body.books, undefined);
 });
 
-test('pairing binds the approving owner, expires, cannot replay, and credentials are hashed', async () => {
+test('six-digit Mac pairing requires phone claim and matching Mac confirmation; secrets stay hashed', async () => {
   const alice = await login();
-  const stale = await call('/api/devices/pairing', { cookie: alice.cookie, body: {} });
-  time += 600_001;
-  assert.equal((await call('/api/devices/claim', { originHeader: null, body: { token: stale.body.token, name: 'Old' } })).status, 401);
-  const linked = await pair(alice.cookie);
-  assert.equal((await call('/api/devices/claim', { originHeader: null, body: { token: linked.token, name: 'Again' } })).status, 401);
-  const devices = await call('/api/devices', { cookie: alice.cookie });
-  assert.equal(devices.body.devices.length, 1);
-  assert.ok(!JSON.stringify(devices.body).includes(linked.credential));
+  const created = await startPairing('Alice Mac');
+  assert.equal(created.status, 200);
+  assert.match(created.body.code, /^\d{6}$/);
+  assert.match(created.body.secret, /^pair_[A-Za-z0-9_-]{43}$/);
+  assert.equal(created.body.interval, 3);
+  assert.equal(Date.parse(created.body.expiresAt), time + 300_000);
+  const storedPairing = (await pool.query('SELECT * FROM books_device_pairings')).rows[0];
+  assert.equal(storedPairing.secret_hash.length, 64); assert.equal(storedPairing.code_hash.length, 64);
+  assert.ok(!JSON.stringify(storedPairing).includes(created.body.secret));
+  assert.notEqual(storedPairing.code_hash, created.body.code);
+  assert.equal(storedPairing.owner_id, null);
+  const pending = await pollPairing(created.body.secret);
+  assert.deepEqual(pending.body, { status: 'pending', expiresAt: created.body.expiresAt });
+  assert.equal((await completePairing(created.body.secret, alice.session.user.id)).status, 409);
+  const claimed = await claimPairing(alice.cookie, created.body.code);
+  assert.deepEqual(claimed.body, { name: 'Alice Mac', deviceId: storedPairing.device_id,
+    expiresAt: created.body.expiresAt, status: 'awaiting_mac' });
+  assert.equal((await call('/api/devices', { cookie: alice.cookie })).body.devices.length, 0);
+  assert.equal((await pollPairing(created.body.secret)).status, 429);
+  time += 3000;
+  const ready = await pollPairing(created.body.secret);
+  assert.deepEqual(ready.body, { status: 'claimed', expiresAt: created.body.expiresAt,
+    account: { id: alice.session.user.id, email: alice.session.user.email } });
+  assert.equal((await completePairing(created.body.secret, 'different-account')).status, 409);
+  const attempts = await Promise.all([completePairing(created.body.secret, alice.session.user.id), completePairing(created.body.secret, alice.session.user.id)]);
+  assert.deepEqual(attempts.map((result) => result.status).sort(), [200, 401]);
+  const linked = attempts.find((result) => result.status === 200).body;
+  assert.equal(linked.device.id, claimed.body.deviceId);
+  assert.match(linked.credential, /^device_[A-Za-z0-9_-]{43}$/);
+  assert.equal((await pollPairing(created.body.secret)).status, 401);
+  assert.equal((await claimPairing(alice.cookie, created.body.code)).status, 400);
+  const devices = (await call('/api/devices', { cookie: alice.cookie })).body.devices;
+  assert.equal(devices.length, 1);
+  assert.ok(!JSON.stringify(devices).includes(linked.credential));
   const stored = (await pool.query('SELECT * FROM books_devices')).rows[0];
   assert.equal(stored.owner_id, alice.session.user.id);
   assert.equal(stored.credential_hash.length, 64);
   assert.ok(!JSON.stringify(stored).includes(linked.credential));
-  const browserClaim = await call('/api/devices/claim', { body: { token: linked.token, name: 'Browser' } });
-  assert.equal(browserClaim.status, 403);
+});
+
+test('pairing expires after five minutes without changing existing devices', async () => {
+  const alice = await login(), linked = await pair(alice.cookie);
+  const stale = await startPairing('Expired Mac');
+  time += 300_000;
+  assert.equal((await claimPairing(alice.cookie, stale.body.code)).status, 400);
+  assert.equal((await pollPairing(stale.body.secret)).status, 401);
+  assert.equal((await completePairing(stale.body.secret, alice.session.user.id)).status, 401);
+  assert.equal((await push(linked.credential)).status, 200);
+  const claimed = await startPairing('Too late to confirm');
+  assert.equal((await claimPairing(alice.cookie, claimed.body.code)).status, 200);
+  time += 300_000;
+  assert.equal((await completePairing(claimed.body.secret, alice.session.user.id)).status, 401);
+  assert.equal((await push(linked.credential, [book()], 2)).status, 200);
+});
+
+test('completion rechecks expiry after waiting for the account lock', async () => {
+  const alice = await login(), linked = await pair(alice.cookie);
+  const created = await startPairing('Delayed confirmation');
+  assert.equal((await claimPairing(alice.cookie, created.body.code)).status, 200);
+  const delayedPool = {
+    async connect() {
+      const client = await pool.connect();
+      return {
+        async query(sql, parameters) {
+          const result = await client.query(sql, parameters);
+          if (sql === 'SELECT id FROM "user" WHERE id=$1 FOR UPDATE') time += 300_000;
+          return result;
+        },
+        release: () => client.release(),
+      };
+    },
+  };
+  const store = new PostgresStore(delayedPool, { now: () => new Date(time) });
+  await assert.rejects(store.completePairing(created.body.secret, alice.session.user.id, true), (error) => error.status === 401);
+  assert.equal((await push(linked.credential)).status, 200);
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM books_devices')).rows[0].count, 1);
+});
+
+test('a code can be claimed once and rejecting the shown account cannot replace a linked Mac', async () => {
+  const alice = await login(), bob = await login('bob@example.test');
+  const linked = await pair(alice.cookie);
+  const created = await startPairing('Unconfirmed Mac');
+  const attempts = await Promise.all([claimPairing(alice.cookie, created.body.code), claimPairing(bob.cookie, created.body.code)]);
+  assert.deepEqual(attempts.map((result) => result.status).sort(), [200, 400]);
+  const claimed = await pollPairing(created.body.secret);
+  const owner = attempts[0].status === 200 ? alice : bob;
+  assert.equal(claimed.body.account.id, owner.session.user.id);
+  assert.deepEqual((await completePairing(created.body.secret, owner.session.user.id, false)).body, { ok: true });
+  assert.equal((await completePairing(created.body.secret, owner.session.user.id)).status, 401);
+  assert.equal((await push(linked.credential)).status, 200);
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM books_devices')).rows[0].count, 1);
+});
+
+test('pairing routes enforce origins, account binding, strict payloads, and secret-only polling', async () => {
+  const alice = await login();
+  const created = await startPairing();
+  for (const path of ['/api/devices/pairing/start', '/api/devices/pairing/poll', '/api/devices/pairing/complete']) {
+    assert.equal((await call(path, { body: {} })).status, 403);
+    assert.equal((await call(path, { originHeader: null, method: 'GET' })).status, 405);
+  }
+  for (const body of [{ code: 123456 }, { code: '12345' }, { code: '1234567' }, { code: '12 345' }, { code: created.body.code, ownerId: alice.session.user.id }]) {
+    assert.equal((await call('/api/devices/pairing', { cookie: alice.cookie, body })).status, 400);
+  }
+  assert.equal((await claimPairing(alice.cookie, created.body.code, { originHeader: null })).status, 403);
+  assert.equal((await claimPairing(alice.cookie, created.body.code, { accountHeader: 'another-account' })).status, 401);
+  assert.equal((await pollPairing(created.body.code)).status, 400);
+  assert.equal((await pollPairing('pair_' + 'x'.repeat(43))).status, 401);
+  assert.equal((await completePairing(created.body.secret, alice.session.user.id, 'yes')).status, 400);
+  assert.equal((await startPairing('   ')).status, 400);
+  assert.equal((await startPairing('Mac', { body: { name: 'Mac', credential: 'secret' } })).status, 400);
+  assert.equal((await call('/api/devices/claim', { cookie: alice.cookie, body: { token: created.body.secret, name: 'Old route' } })).status, 404);
+});
+
+test('pairing start limits are shared and concurrent requests cannot exceed the IP quota', async () => {
+  const results = await Promise.all(Array.from({ length: 11 }, (_, index) => startPairing(`Mac ${index}`)));
+  assert.equal(results.filter((result) => result.status === 200).length, 10);
+  assert.equal(results.filter((result) => result.status === 429).length, 1);
+  assert.equal((await startPairing('Still limited')).status, 429);
+  assert.equal((await startPairing('Different network', { ip: '203.0.113.8' })).status, 200);
+  time += 600_000;
+  assert.equal((await startPairing('After expiry')).status, 200);
+});
+
+test('failed code claims count toward account limits and recover after the window', async () => {
+  const alice = await login();
+  const results = await Promise.all(Array.from({ length: 6 }, () => claimPairing(alice.cookie, '000000')));
+  assert.equal(results.filter((result) => result.status === 400).length, 5);
+  assert.equal(results.filter((result) => result.status === 429).length, 1);
+  assert.equal((await claimPairing(alice.cookie, '000000', { ip: '203.0.113.8' })).status, 429);
+  time += 300_000;
+  assert.equal((await claimPairing(alice.cookie, '000000')).status, 400);
+});
+
+test('claim IP limits apply across signed-in accounts', async () => {
+  const users = [];
+  for (let index = 0; index < 5; index++) users.push(await login(`person${index}@example.test`, `203.0.113.${index + 20}`));
+  for (const user of users.slice(0, 4)) {
+    for (let index = 0; index < 5; index++) assert.equal((await claimPairing(user.cookie, '000000')).status, 400);
+  }
+  assert.equal((await claimPairing(users[4].cookie, '000000')).status, 429);
+  assert.equal((await claimPairing(users[4].cookie, '000000', { ip: '203.0.113.99' })).status, 400);
+});
+
+test('code collisions retry without replacing an active pairing and leading zeroes survive', async () => {
+  const codes = ['000123', '000123', '456789'];
+  const store = new PostgresStore(pool, { now: () => new Date(time), pairingCode: () => codes.shift() });
+  const results = await Promise.all([store.startPairing('First', '203.0.113.1'), store.startPairing('Second', '203.0.113.1')]);
+  assert.deepEqual(results.map((result) => result.code), ['000123', '456789']);
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM books_device_pairings')).rows[0].count, 2);
+  const alice = await login();
+  assert.equal((await claimPairing(alice.cookie, '000123')).body.name, 'First');
+  assert.equal((await claimPairing(alice.cookie, '456789')).body.name, 'Second');
+  const exhausted = new PostgresStore(pool, { now: () => new Date(time), pairingCode: () => '000123' });
+  await assert.rejects(exhausted.startPairing('Collision', '203.0.113.1'), (error) => error.status === 503);
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM books_device_pairings')).rows[0].count, 2);
 });
 
 test('two accounts cannot read, change, revoke, or pull each other’s books and devices', async () => {
@@ -280,13 +433,16 @@ test('an old reader tab cannot use a newly signed-in account cookie', async () =
   assert.equal((await call('/api/books/BOOK1', { cookie: bob.cookie })).body.webPosition, null);
 });
 
-test('linking a replacement Mac revokes the old writer and supersedes old unclaimed codes', async () => {
+test('linking a replacement Mac keeps the old writer until the Mac confirms its account', async () => {
   const alice = await login(); const first = await pair(alice.cookie, 'First Mac'); await push(first.credential);
-  const obsolete = await call('/api/devices/pairing', { cookie: alice.cookie, body: {} });
-  const replacement = await pair(alice.cookie, 'Replacement Mac');
-  assert.equal((await call('/api/devices/claim', { originHeader: null, body: { token: obsolete.body.token, name: 'Obsolete' } })).status, 401);
-  assert.equal((await push(first.credential, [book({ title: 'Old Mac' })], 2)).status, 401);
-  assert.equal((await push(replacement.credential, [book({ title: 'New Mac' })])).status, 200);
+  const replacement = await startPairing('Replacement Mac');
+  const claimed = await claimPairing(alice.cookie, replacement.body.code);
+  assert.equal(claimed.status, 200);
+  assert.equal((await push(first.credential, [book()], 2)).status, 200);
+  const finished = await completePairing(replacement.body.secret, alice.session.user.id);
+  assert.equal(finished.status, 200);
+  assert.equal((await push(first.credential, [book({ title: 'Old Mac' })], 3)).status, 401);
+  assert.equal((await push(finished.body.credential, [book({ title: 'New Mac' })])).status, 200);
   const devices = (await call('/api/devices', { cookie: alice.cookie })).body.devices;
   assert.equal(devices.length, 2); assert.equal(devices.filter((device) => !device.revokedAt).length, 1);
   assert.equal((await call('/api/books/BOOK1', { cookie: alice.cookie })).body.title, 'New Mac');

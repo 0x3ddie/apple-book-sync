@@ -5,11 +5,12 @@ import json
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from companion import (CompanionError, MAX_BODY, SyncClient, encode, metadata_book, migrate_legacy_config,
+from companion import (CompanionError, MAX_BODY, SyncClient, encode, metadata_book, migrate_legacy_config, pair,
                        read_config, server_origin, snapshot_batches, sync, write_config)
 
 
@@ -221,6 +222,142 @@ class CompanionTest(unittest.TestCase):
                           ("GET", "/api/companion/positions")])
         self.assertGreater(requests[1].args[2]["sequence"], failed_sequence)
         self.assertIn("snapshotHash", read_config(self.path))
+
+
+class PairingTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.path = Path(self.temporary.name) / ".local/companion.json"
+        self.wall_time = datetime(2026, 11, 14, tzinfo=timezone.utc).timestamp()
+        self.elapsed = 0
+        self.waits = []
+        self.secret = "pair_" + "a" * 43
+        self.credential = "device_" + "b" * 43
+        self.expiry = datetime.fromtimestamp(self.wall_time + 300, timezone.utc).isoformat()
+        self.start = {"code": "012345", "secret": self.secret, "expiresAt": self.expiry, "interval": 3}
+        self.pending = {"status": "pending", "expiresAt": self.expiry}
+        self.claimed = {"status": "claimed", "expiresAt": self.expiry,
+                        "account": {"id": "account-one", "email": "reader@example.com"}}
+        self.complete = {"device": {"id": "new-device"}, "credential": self.credential}
+        self.request = self.enterContext(patch("companion.SyncClient.request"))
+        self.confirm = self.enterContext(patch("builtins.input", return_value="yes"))
+        self.enterContext(patch("companion.sys.stdin.isatty", return_value=True))
+        self.enterContext(patch("companion.time.time", side_effect=lambda: self.wall_time + self.elapsed))
+        self.enterContext(patch("companion.time.monotonic", side_effect=lambda: self.elapsed))
+
+        def sleep(seconds):
+            self.waits.append(seconds)
+            self.elapsed += seconds
+            if len(self.waits) > 105:
+                raise AssertionError("Pairing did not expire")
+
+        self.enterContext(patch("companion.time.sleep", side_effect=sleep))
+        self.output = io.StringIO()
+        self.enterContext(contextlib.redirect_stdout(self.output))
+
+    def run_pair(self):
+        return pair("https://reader.example", " Test Mac ", path=self.path)
+
+    def test_phone_claim_requires_local_confirmation_before_credentials_are_saved(self):
+        self.request.side_effect = [self.start, CompanionError("Rate limited", status=429),
+                                    self.pending, self.claimed, self.complete]
+
+        def confirm(prompt):
+            self.assertFalse(self.path.exists())
+            self.assertNotIn("/api/devices/pairing/complete", [call.args[1] for call in self.request.call_args_list])
+            self.assertIn("reader@example.com", self.output.getvalue())
+            return " YES "
+
+        self.confirm.side_effect = confirm
+        with patch("companion.BooksLibrary") as library, patch("companion.sync") as metadata_sync:
+            self.assertTrue(self.run_pair())
+        library.assert_not_called()
+        metadata_sync.assert_not_called()
+        self.assertEqual(self.waits, [3, 3, 3])
+        self.assertEqual([call.args for call in self.request.call_args_list], [
+            ("POST", "/api/devices/pairing/start", {"name": "Test Mac"}),
+            *[("POST", "/api/devices/pairing/poll", {"secret": self.secret}) for _ in range(3)],
+            ("POST", "/api/devices/pairing/complete", {"secret": self.secret, "accountId": "account-one", "approve": True}),
+        ])
+        config = read_config(self.path)
+        self.assertEqual(config["deviceId"], "new-device")
+        self.assertEqual(config["credential"], self.credential)
+        self.assertEqual(config["name"], "Test Mac")
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        self.assertIn("012 345", self.output.getvalue())
+        self.assertNotIn(self.secret, self.output.getvalue())
+        self.assertNotIn(self.credential, self.output.getvalue())
+
+    def test_default_or_explicit_rejection_consumes_code_without_saving_credentials(self):
+        for answer in ("", "no", "y"):
+            with self.subTest(answer=answer):
+                self.request.side_effect = [self.start, self.claimed, {"ok": True}]
+                self.confirm.return_value = answer
+                self.assertFalse(self.run_pair())
+                self.request.assert_called_with("POST", "/api/devices/pairing/complete",
+                                                {"secret": self.secret, "accountId": "account-one", "approve": False})
+                self.assertFalse(self.path.exists())
+
+    def test_pending_pairing_expires_without_confirmation_or_completion(self):
+        self.request.side_effect = lambda method, endpoint, payload: self.start if endpoint.endswith("/start") else self.pending
+        with self.assertRaisesRegex(CompanionError, "expired"):
+            self.run_pair()
+        self.assertEqual(self.elapsed, 300)
+        self.confirm.assert_not_called()
+        self.assertTrue(all(call.args[1].endswith(("/start", "/poll")) for call in self.request.call_args_list))
+        self.assertFalse(self.path.exists())
+
+    def test_expiry_during_confirmation_never_completes_or_writes(self):
+        self.request.side_effect = [self.start, self.claimed]
+
+        def delayed_confirmation(prompt):
+            self.elapsed = 301
+            return "yes"
+
+        self.confirm.side_effect = delayed_confirmation
+        with self.assertRaisesRegex(CompanionError, "expired before confirmation"):
+            self.run_pair()
+        self.assertEqual(self.request.call_count, 2)
+        self.assertFalse(self.path.exists())
+
+    def test_untrusted_pairing_responses_fail_closed(self):
+        bad_account = dict(self.claimed, account={"id": "account-one", "email": "reader@example.com\x1b[2J"})
+        changed_expiry = dict(self.claimed, expiresAt=datetime.fromtimestamp(self.wall_time + 301, timezone.utc).isoformat())
+        for responses in ([dict(self.start, secret="not-a-pairing-secret")],
+                          [dict(self.start, code="12\n345")],
+                          [dict(self.start, expiresAt="2099-01-01T00:00:00Z")],
+                          [self.start, bad_account], [self.start, changed_expiry],
+                          [self.start, self.claimed, dict(self.complete, credential="not-a-device-credential")]):
+            with self.subTest(responses=responses):
+                self.elapsed = 0
+                self.request.side_effect = responses
+                with self.assertRaises(CompanionError):
+                    self.run_pair()
+                self.assertFalse(self.path.exists())
+                self.assertNotIn("\x1b", self.output.getvalue())
+
+    def test_existing_pairing_is_kept_without_network_requests(self):
+        original = {"server": "https://reader.example", "deviceId": "already-paired", "name": "Old Mac",
+                    "credential": self.credential, "sequence": 1, "allowLocalHttp": False}
+        write_config(original, self.path)
+        before = self.path.read_bytes()
+        with self.assertRaisesRegex(CompanionError, "already has a pairing"):
+            self.run_pair()
+        self.request.assert_not_called()
+        self.confirm.assert_not_called()
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_missing_terminal_and_expired_server_session_never_save_credentials(self):
+        with patch("companion.sys.stdin.isatty", return_value=False):
+            with self.assertRaisesRegex(CompanionError, "terminal"):
+                self.run_pair()
+        self.request.assert_not_called()
+        self.request.side_effect = [self.start, CompanionError("Expired", status=401)]
+        with self.assertRaisesRegex(CompanionError, "expired or was cancelled"):
+            self.run_pair()
+        self.confirm.assert_not_called()
+        self.assertFalse(self.path.exists())
 
 
 if __name__ == "__main__":
