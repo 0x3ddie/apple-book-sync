@@ -2,7 +2,7 @@
 
 A browser bookshelf with a local Apple Books bridge and an optional private cloud metadata service. Keep using Books on Apple devices, choose EPUBs to save in the browser, and keep a separate web reading position for each book.
 
-Hosted preview: [apple-book-sync.vercel.app](https://apple-book-sync.vercel.app/). The production deployment is configured, the Neon schema migration is complete, and the email sign-in form is active. The Resend sending domain is verified; the first real inbox-delivery check is still pending.
+Hosted preview: [apple-book-sync.vercel.app](https://apple-book-sync.vercel.app/). The production deployment is configured, the Neon schema migration is complete, and the email sign-in form is active. The Resend sending domain and delivery of a real sign-in email are verified. Phone sign-in is awaiting the user opening the email link.
 
 ## What works locally
 
@@ -15,7 +15,7 @@ Hosted preview: [apple-book-sync.vercel.app](https://apple-book-sync.vercel.app/
 - Page turns save automatically. Done reading waits for a save before returning to the library. Unsent positions have a browser-local backup; hiding/leaving the page also attempts a keepalive save.
 - Changes in both Books and the web reader prompt a position choice. Per-book revisions and session sequences protect against stale requests and competing tabs.
 
-**Saving in the web reader does not update Apple Books automatically.** The manual Open this position in Apple Books link works on the Mac. Automatic position application, direct EPUB transfer to Android, and iPad propagation are not implemented or verified. The Python preview binds only to `127.0.0.1`; the local preview itself is not phone-accessible. Cloud account and metadata APIs are deployed and configured; the first real email sign-in test remains pending.
+**Saving in the web reader does not update Apple Books automatically.** The manual Open this position in Apple Books link works on the Mac. Automatic position application, direct EPUB transfer to Android, and iPad propagation are not implemented or verified. The Python preview binds only to `127.0.0.1`; the local preview itself is not phone-accessible. Cloud account and metadata APIs are deployed and configured, and live sign-in email delivery is verified. Phone sign-in has not yet been verified.
 
 Only downloaded, readable, DRM-free EPUBs can open. iCloud placeholders appear in the library with instructions to download them in Books first; listing the library does not intentionally hydrate cloud files. Annotations are imported read-only. Changes made here are not written into Apple’s databases.
 
@@ -44,7 +44,7 @@ To configure a deployment:
 2. Run `npm run migrate:cloud` with those environment variables available. For a local ignored `.env` file, use `node --env-file=.env cloud/migrate.mjs`. Migrations create the Better Auth and Books tables; they do not send emails.
 3. Deploy using the included `vercel.json`. `npm run build` copies an explicit allowlist of public reader files and vendor scripts into `dist/`. The Vercel function in `api/index.mjs` serves cloud metadata through an explicit `/api/:path*` rewrite; the Python bridge is excluded. Missing configuration leaves all cloud endpoints closed with HTTP 503.
 
-The Vercel deployment is live at [apple-book-sync.vercel.app](https://apple-book-sync.vercel.app/), with the Neon schema migration complete and production configuration in place. Resend is configured to send from `reading@books.eddiechen.xyz`. All required sender DNS records are verified. Live checks confirm that anonymous library requests are rejected and nested auth, pairing, and companion routes reach the application. The first real inbox-delivery check is still pending; automated tests capture emails in memory.
+The Vercel deployment is live at [apple-book-sync.vercel.app](https://apple-book-sync.vercel.app/), with the Neon schema migration complete and production configuration in place. Resend is configured to send from `reading@books.eddiechen.xyz`. All required sender DNS records are verified. Live checks confirm that anonymous library requests are rejected and nested auth, pairing, and companion routes reach the application. A live sign-in request returned HTTP 200, and Resend confirmed that the real email was delivered. Phone sign-in still needs the user to open the link on their phone; automated tests capture emails in memory.
 
 ## Download and pair the Mac companion
 
