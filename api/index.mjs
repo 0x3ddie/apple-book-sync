@@ -1,6 +1,8 @@
 import handle from "../cloud/handler.mjs";
 import { isIP } from "node:net";
 
+// vercel.json sends every /api/* path here. The rewrite preserves the original
+// request URL, including nested auth routes and the magic-link query string.
 // Vercel's Fetch handler keeps session cookies and streaming limits intact.
 export default {
   fetch(request) {
