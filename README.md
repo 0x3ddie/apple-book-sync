@@ -4,7 +4,7 @@ A browser bookshelf with a local Apple Books bridge and an optional private clou
 
 Hosted preview: [apple-book-sync.vercel.app](https://apple-book-sync.vercel.app/). The production deployment and Neon database are configured. Live email delivery, user-confirmed phone sign-in, Mac pairing, and metadata upload and readback have been verified.
 
-Direct EPUB transfer is implemented with automated sender and signaling tests passing. Full browser and phone transfer/offline-reading checks are still pending.
+Direct EPUB transfer is deployed and verified in signed-in Chrome against the live service. A separate browser test transferred a generated EPUB, stopped its server, reloaded the reader offline, and preserved page turns across another reload. Android device testing remains a separate user check.
 
 ## What works locally
 
@@ -130,4 +130,4 @@ npm run build
 
 After installing transfer dependencies, run `.local/transfer-venv/bin/python -m unittest discover -s tests -v` to include the real WebRTC peer tests. Without those dependencies, the direct-transfer Python tests are skipped.
 
-Python tests use temporary Books-like databases and EPUB fixtures. They cover per-book persistence, out-of-order saves, competing readers, Apple-position conflicts, invalid input, EPUB/annotation import, iCloud placeholders, HTTP Host/Origin checks, metadata-only companion payloads, credentials, and batching. Three direct-transfer tests pass using real WebRTC peers. The 14 cloud tests exercise real Better Auth and PostgreSQL via PGlite, including account isolation, pairing, position conflicts, and transfer signaling expiry/replay/revocation and payload restrictions. Tests do not modify the real Apple Books library or send real emails. Automated peer and signaling checks do not replace the pending full browser/phone offline-reading check.
+Python tests use temporary Books-like databases and EPUB fixtures. They cover per-book persistence, out-of-order saves, competing readers, Apple-position conflicts, invalid input, EPUB/annotation import, iCloud placeholders, HTTP Host/Origin checks, metadata-only companion payloads, credentials, and batching. Three direct-transfer tests pass using real WebRTC peers. The 14 cloud tests exercise real Better Auth and PostgreSQL via PGlite, including account isolation, pairing, position conflicts, and transfer signaling expiry/replay/revocation and payload restrictions. Tests do not modify the real Apple Books library or send real emails. The 12 browser protocol/storage tests cover validation, cancellation, account changes, and acknowledgment after durable storage. A Chrome UI check verified real direct transfer through production; an isolated EPUB fixture verified full reload and saved-position persistence with its server stopped. No Android device was automated.
