@@ -18,6 +18,7 @@ FILES = {
     "/": ROOT / "public/index.html",
     "/reader.js": ROOT / "public/reader.js",
     "/offline.js": ROOT / "public/offline.js",
+    "/transfer.js": ROOT / "public/transfer.js",
     "/account.js": ROOT / "public/account.js",
     "/sw.js": ROOT / "public/sw.js",
     "/styles.css": ROOT / "public/styles.css",

@@ -26,8 +26,11 @@ const OfflineBooks = window.OfflineBooks = (() => {
       db?.close();
     }
   }
-  async function transaction(store, mode, operation) {
+  async function transaction(store, mode, operation, expectedScope) {
+    const operationScope = scope;
+    if (expectedScope && expectedScope !== operationScope) throw new Error("Your account changed. Reopen your library before saving books.");
     const db = await open();
+    if (scope !== operationScope) throw new Error("Your account changed. Reopen your library before saving books.");
     return new Promise((resolve, reject) => {
       const tx = db.transaction(store, mode);
       const request = operation(tx.objectStore(store));
@@ -81,7 +84,7 @@ const OfflineBooks = window.OfflineBooks = (() => {
     prepareShell,
     list: () => transaction("books", "readonly", (store) => store.getAll()),
     get: (id) => transaction("books", "readonly", (store) => store.get(id)),
-    put: (record) => transaction("books", "readwrite", (store) => store.put(record)),
+    put: (record, expectedScope) => transaction("books", "readwrite", (store) => store.put(record), expectedScope),
     remove: (id) => transaction("books", "readwrite", (store) => store.delete(id)),
     saveLibrary: (books) => transaction("library", "readwrite", (store) => store.put(books, "catalogue")),
     readLibrary: () => transaction("library", "readonly", (store) => store.get("catalogue")),

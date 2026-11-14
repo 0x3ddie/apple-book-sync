@@ -29,6 +29,10 @@ MAX_SEQUENCE = 9007199254740991
 class CompanionError(Exception):
     """An actionable error whose message contains no credentials."""
 
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
 
 def server_origin(value, allow_local_http=False):
     if not isinstance(value, str):
@@ -86,7 +90,7 @@ class SyncClient:
                     raise CompanionError("The sync service returned too much data.")
                 result = json.loads(content)
         except urllib.error.HTTPError as error:
-            raise CompanionError(f"The sync service returned HTTP {error.code}. Check the website's device settings.") from None
+            raise CompanionError(f"The sync service returned HTTP {error.code}. Check the website's device settings.", status=error.code) from None
         except (urllib.error.URLError, TimeoutError, OSError):
             raise CompanionError("Could not reach the sync service. Check the connection and server URL.") from None
         except (ValueError, UnicodeError):
@@ -270,6 +274,8 @@ def main():
     pairing.add_argument("--name", default="Mac companion")
     pairing.add_argument("--allow-local-http", action="store_true", help="Development only: permit http://127.0.0.1")
     commands.add_parser("sync", help="Send one metadata snapshot; does not change Apple Books")
+    sharing = commands.add_parser("serve", help="Offer selected EPUBs directly to your devices on the same Wi-Fi")
+    sharing.add_argument("--minutes", type=int, default=30, help="How long to offer transfers (1–480; default 30 minutes)")
     commands.add_parser("status", help="Show pairing details without credentials")
     commands.add_parser("unpair", help="Remove the local credential; revoke the device separately on the website")
     arguments = parser.parse_args()
@@ -279,6 +285,15 @@ def main():
                 pair(arguments.server, arguments.name, arguments.allow_local_http)
         elif arguments.command == "sync":
             sync()
+        elif arguments.command == "serve":
+            if not 1 <= arguments.minutes <= 480:
+                raise CompanionError("Choose a transfer window between 1 and 480 minutes.")
+            try:
+                import asyncio
+                from transfer import serve_transfers
+            except ImportError:
+                raise CompanionError("Run ./scripts/start-transfers.sh to install the direct-transfer dependencies.") from None
+            asyncio.run(serve_transfers(minutes=arguments.minutes))
         elif arguments.command == "status":
             config = read_config()
             print(f"Paired: {config.get('name', 'Mac companion')}\nServer: {config['server']}\nDevice: {config['deviceId']}\nLast reserved sequence: {config['sequence']}")
@@ -290,6 +305,9 @@ def main():
     except (CompanionError, OSError, RuntimeError, sqlite3.Error) as error:
         print(f"Companion: {error}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        print("\nTransfers stopped. Books already saved on your phone remain available offline.")
+        return 0
     return 0
 
 

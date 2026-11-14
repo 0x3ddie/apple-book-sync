@@ -321,6 +321,7 @@ h2 {
 .shelf-item .book-card { width:100%; }
 .download-button { margin-top:12px; padding:8px 0; min-height:38px; font-size:12px; background:none; color:var(--blue); text-align:left; }
 .download-button:hover:not(:disabled) { text-decoration:underline; }
+.download-progress { color:var(--muted); font-size:11px; line-height:1.4; margin-top:2px; }
 .offline-badge { color:var(--sage); font-size:11px; margin-top:7px; }
 .offline-summary { display:flex; justify-content:space-between; align-items:center; gap:20px; background:#e7edf2; border:1px solid var(--line); border-radius:10px; padding:20px 22px; margin-bottom:32px; }
 .offline-summary h2 { font-size:18px; margin-bottom:5px; }

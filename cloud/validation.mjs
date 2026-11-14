@@ -17,6 +17,51 @@ export function string(value, max, label, { empty = false, pattern } = {}) {
 }
 
 export const identifier = (value, label = 'book identifier') => string(value, 200, label, { pattern: /^[A-Za-z0-9._:-]+$/ });
+
+// Accept only WebRTC data-channel description fields produced by browsers and
+// aiortc. No free-form session text, media tracks, URLs, or encoded files.
+export function transferDescription(value, type) {
+  fields(value, ['type', 'sdp'], 'connection description');
+  if (value.type !== type) throw new HttpError(400, 'Invalid connection description type.');
+  if (typeof value.sdp !== 'string' || value.sdp.length > 32768 || /[^\x20-\x7e\r\n]/.test(value.sdp)) {
+    throw new HttpError(400, 'Invalid connection description.');
+  }
+  const lines = value.sdp.replace(/\r\n/g, '\n').split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  const address = '(?:[A-Fa-f0-9:.]+|[A-Za-z0-9-]+\\.local)';
+  const candidate = new RegExp(`^a=candidate:[A-Za-z0-9+/]{1,64} [12] (?:udp|tcp|UDP|TCP) \\d{1,10} ${address} \\d{1,5} typ (?:host|srflx|prflx|relay)(?: (?:raddr ${address}|rport \\d{1,5}|tcptype (?:active|passive|so)|generation \\d{1,10}|ufrag [A-Za-z0-9+/]{1,256}|network-id \\d{1,10}|network-cost \\d{1,10}))*$`);
+  const allowed = [
+    /^v=0$/, /^o=-?\d* \d+ \d+ IN IP[46] [A-Fa-f0-9:.]+$/, /^s=-$/, /^t=0 0$/,
+    /^m=application \d{1,5} (?:UDP\/DTLS\/SCTP webrtc-datachannel|DTLS\/SCTP \d{1,5})$/,
+    /^c=IN IP[46] [A-Fa-f0-9:.]+$/, /^a=group:BUNDLE [A-Za-z0-9_-]{1,32}$/,
+    /^a=msid-semantic:\s*WMS(?: \*)?$/, /^a=extmap-allow-mixed$/,
+    /^a=mid:[A-Za-z0-9_-]{1,32}$/, /^a=ice-ufrag:[A-Za-z0-9+/]{1,256}$/,
+    /^a=ice-pwd:[A-Za-z0-9+/]{1,256}$/, /^a=ice-options:(?:trickle|renomination)(?: (?:trickle|renomination))*$/,
+    /^a=fingerprint:sha-(?:256|384|512) (?:[A-Fa-f0-9]{2}:){31,63}[A-Fa-f0-9]{2}$/,
+    /^a=setup:(?:actpass|active|passive)$/, /^a=sctp-port:\d{1,5}$/,
+    /^a=sctpmap:\d{1,5} webrtc-datachannel \d{1,5}$/, /^a=max-message-size:\d{1,10}$/,
+    /^a=end-of-candidates$/, candidate,
+  ];
+  if (!lines.length || lines.length > 128 || lines.some((line) => line.length > 512 || !allowed.some((rule) => rule.test(line)))
+      || lines.filter((line) => line.startsWith('m=')).length !== 1
+      || ['v=', 'o=', 's=', 't=', 'a=ice-ufrag:', 'a=ice-pwd:', 'a=fingerprint:', 'a=setup:'].some((prefix) => !lines.some((line) => line.startsWith(prefix)))) {
+    throw new HttpError(400, 'Only a WebRTC data-channel connection description is accepted.');
+  }
+  return { type, sdp: lines.join('\r\n') + '\r\n' };
+}
+
+export function transferRequest(value) {
+  fields(value, ['bookId', 'offer'], 'transfer');
+  return { bookId: identifier(value.bookId), offer: transferDescription(value.offer, 'offer') };
+}
+
+export function transferAnswer(value) {
+  fields(value, ['answer', 'error'], 'transfer answer');
+  if (Object.hasOwn(value, 'answer') === Object.hasOwn(value, 'error')) throw new HttpError(400, 'Provide a connection answer or a transfer error.');
+  if (Object.hasOwn(value, 'answer')) return { answer: transferDescription(value.answer, 'answer'), error: null };
+  if (!['BOOK_UNAVAILABLE', 'TRANSFER_FAILED', 'BOOK_TOO_LARGE'].includes(value.error)) throw new HttpError(400, 'Invalid transfer error.');
+  return { answer: null, error: value.error };
+}
 export const cfi = (value) => string(value, 8192, 'EPUB position', { pattern: /^epubcfi\([^\x00-\x1f]+\)$/ });
 export function integer(value, label) {
   if (!Number.isSafeInteger(value) || value < 0) throw new HttpError(400, `Invalid ${label}.`);

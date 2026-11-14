@@ -1,7 +1,7 @@
 "use strict";
 
-const CACHE = "books-reader-shell-v9";
-const SHELL = ["/", "/styles.css", "/account.js", "/reader.js", "/offline.js", "/vendor/epub.js", "/vendor/jszip.min.js"];
+const CACHE = "books-reader-shell-v10";
+const SHELL = ["/", "/styles.css", "/account.js", "/reader.js", "/transfer.js", "/offline.js", "/vendor/epub.js", "/vendor/jszip.min.js"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil((async () => {

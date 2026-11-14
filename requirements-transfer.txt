@@ -1,0 +1,2 @@
+# Direct EPUB transfer is optional; metadata-only companion commands stay stdlib-only.
+aiortc==1.16.0

@@ -8,7 +8,7 @@ const state = {
   location: null, currentCfi: null, ready: false, opening: false,
   sequence: 0, draft: null, saveQueue: Promise.resolve(),
   navigation: null, libraryRequest: 0, storageWarning: false,
-  savedBooks: new Map(), coverUrls: new Map(), downloads: new Set(), bridgeOnline: true,
+  savedBooks: new Map(), coverUrls: new Map(), downloads: new Map(), bridgeOnline: true,
   offlineReady: false, syncingBackups: false,
   accountReady: false,
 };
@@ -90,13 +90,18 @@ function coverFor(book) {
   return cover;
 }
 
+function canDownload(book) {
+  return state.bridgeOnline && (book.readable || window.ReaderAccount.current?.mode === "cloud" && book.availableOnMac);
+}
+
 function bookButton(book, continuing = false) {
   const button = element("button", continuing ? "continue-book" : "book-card");
   button.type = "button";
   const saved = state.savedBooks.has(book.id);
   const readable = saved || state.bridgeOnline && book.readable;
-  button.disabled = !readable || state.downloads.has(book.id);
-  button.setAttribute("aria-label", `${readable ? "Read" : "Unavailable:"} ${book.title}`);
+  const downloadable = !saved && state.offlineReady && canDownload(book);
+  button.disabled = !(readable || downloadable) || state.downloads.has(book.id);
+  button.setAttribute("aria-label", `${readable ? "Read" : downloadable ? "Save and read:" : "Unavailable:"} ${book.title}`);
   button.append(coverFor(book));
   const info = element("div", "book-info");
   info.append(element("h3", "", book.title), element("p", "book-author", book.author || "Unknown author"));
@@ -113,24 +118,35 @@ function bookButton(book, continuing = false) {
     else if (book.syncState === "conflict") info.append(element("p", "pending-label", "Choose your reading position"));
     if (continuing) info.append(element("p", "read-label", "Continue reading"));
   } else {
-    info.append(element("p", "book-availability", !state.bridgeOnline ? "Not saved on this device" : book.unavailableReason || "Download this EPUB in Apple Books first."));
+    info.append(element("p", "book-availability", !state.bridgeOnline ? "Not saved on this device" : downloadable ? "Save from your Mac to read here" : window.ReaderAccount.current?.mode === "cloud" ? "Download this EPUB in Apple Books on your Mac first." : book.unavailableReason || "Download this EPUB in Apple Books first."));
   }
   if (saved) info.append(element("p", "offline-badge", "✓ Saved on this device"));
   button.append(info);
-  button.addEventListener("click", () => openBook(book.id));
+  button.addEventListener("click", async () => {
+    if (!readable && downloadable) {
+      if (await toggleDownload(book)) await openBook(book.id);
+    } else await openBook(book.id);
+  });
   return button;
 }
 
 function shelfItem(book) {
   const item = element("div", "shelf-item");
   item.append(bookButton(book));
-  const saved = state.savedBooks.has(book.id), busy = state.downloads.has(book.id);
-  const action = element("button", "download-button", busy ? "Saving…" : saved ? "Remove download" : "Save offline");
+  const saved = state.savedBooks.has(book.id), download = state.downloads.get(book.id);
+  const action = element("button", "download-button", download ? download.saving ? "Saving on this device…" : "Cancel download" : saved ? "Remove download" : "Save offline");
   action.type = "button";
-  action.disabled = busy || !state.offlineReady || !saved && (!state.bridgeOnline || !book.readable);
-  action.setAttribute("aria-label", `${saved ? "Remove download of" : "Save offline:"} ${book.title}`);
-  action.addEventListener("click", () => toggleDownload(book));
+  action.id = `download-action-${book.id}`;
+  action.disabled = download?.saving || !download && (!state.offlineReady || !saved && !canDownload(book));
+  action.setAttribute("aria-label", `${download ? "Cancel download of" : saved ? "Remove download of" : "Save offline:"} ${book.title}`);
+  action.addEventListener("click", () => download ? download.controller.abort() : toggleDownload(book));
   item.append(action);
+  if (download) {
+    const progress = element("p", "download-progress", download.message);
+    progress.id = `download-status-${book.id}`;
+    progress.setAttribute("role", "status");
+    item.append(progress);
+  }
   return item;
 }
 
@@ -156,42 +172,94 @@ async function loadSavedBooks() {
 }
 
 async function toggleDownload(book) {
-  if (!state.accountReady) return;
-  if (state.downloads.has(book.id)) return;
-  state.downloads.add(book.id);
+  if (!state.accountReady || state.downloads.has(book.id)) return false;
+  const scope = window.ReaderAccount.current.scope;
+  const controller = new AbortController();
+  const download = { controller, message: "Preparing download…" };
+  state.downloads.set(book.id, download);
   renderLibrary();
   showError("library-error", "");
+  function checkAccount() {
+    if (!state.accountReady || window.ReaderAccount.current?.scope !== scope) throw new Error("Your account changed. Reopen your library before saving books.");
+    controller.signal.throwIfAborted();
+  }
+  function progress(value) {
+    const percentage = value.total ? Math.min(100, Math.round(value.received / value.total * 100)) : 0;
+    const labels = {
+      connecting: "Connecting to your Mac…",
+      receiving: `Copying from Mac · ${percentage}%`,
+      verifying: "Checking your book…",
+      saving: "Saving on this device…",
+    };
+    download.message = labels[value.phase] || "Saving…";
+    download.saving = value.phase === "saving";
+    const action = el(`download-action-${book.id}`);
+    if (action && download.saving) { action.disabled = true; action.textContent = "Saving on this device…"; }
+    const label = el(`download-status-${book.id}`);
+    if (label && label.textContent !== download.message) label.textContent = download.message;
+  }
   try {
     if (state.syncingBackups) await state.syncingBackups;
+    checkAccount();
     if (state.savedBooks.has(book.id)) {
       await OfflineBooks.remove(book.id);
     } else {
       await OfflineBooks.prepareShell();
+      checkAccount();
       const detail = await api(`/api/books/${encodeURIComponent(book.id)}`);
-      if (!detail.readable) throw new Error(detail.unavailableReason || "Download the EPUB in Apple Books first.");
-      const response = await fetch(detail.epubUrl, { cache: "no-store" });
-      if (!response.ok) throw new Error("The book could not be copied from your Mac. Please try again.");
-      const epub = await response.blob();
-      if (!epub.size) throw new Error("The downloaded book was empty. Please try again.");
-      let cover = null;
-      if (detail.coverUrl) {
-        try {
-          const result = await fetch(detail.coverUrl, { cache: "no-store" });
-          if (result.ok) cover = await result.blob();
-        } catch { /* A missing cover does not prevent offline reading. */ }
+      checkAccount();
+      async function save(epub, cover = null) {
+        checkAccount();
+        const record = { id: book.id, detail, epub, cover, bytes: epub.size + (cover?.size || 0), savedAt: new Date().toISOString() };
+        await OfflineBooks.put(record, scope);
+        return record;
       }
-      await OfflineBooks.put({ id: book.id, detail, epub, cover, bytes: epub.size + (cover?.size || 0), savedAt: new Date().toISOString() });
+      if (window.ReaderAccount.current.mode === "cloud") {
+        if (!detail.availableOnMac) throw new Error("Download this EPUB in Apple Books on your Mac, then sync and try again.");
+        await window.BookTransfer.receive({
+          bookId: book.id, signal: controller.signal, onProgress: progress, save,
+          request: (path, options = {}) => {
+            // Cancellation must still be able to delete connection metadata.
+            if (!state.accountReady || window.ReaderAccount.current?.scope !== scope) throw new Error("Your account changed.");
+            const body = options.body;
+            return api(path, { ...options, ...(body === undefined ? {} : { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }) });
+          },
+        });
+      } else {
+        if (!detail.readable) throw new Error(detail.unavailableReason || "Download the EPUB in Apple Books first.");
+        const response = await fetch(detail.epubUrl, { cache: "no-store", signal: controller.signal });
+        if (!response.ok) throw new Error("The book could not be copied from your Mac. Please try again.");
+        const epub = await response.blob();
+        if (!epub.size) throw new Error("The downloaded book was empty. Please try again.");
+        let cover = null;
+        if (detail.coverUrl) {
+          try {
+            const result = await fetch(detail.coverUrl, { cache: "no-store", signal: controller.signal });
+            if (result.ok) cover = await result.blob();
+          } catch { /* A missing cover does not prevent offline reading. */ }
+        }
+        await save(epub, cover);
+      }
       // Browsers may decline persistence. Never imply a permanent storage guarantee.
       navigator.storage?.persist?.().catch(() => {});
     }
-    await loadSavedBooks();
+    if (state.accountReady && window.ReaderAccount.current?.scope === scope) await loadSavedBooks();
+    return true;
   } catch (error) {
-    showError("library-error", error.name === "QuotaExceededError"
-      ? "There isn’t enough space on this device. Remove a download and try again."
-      : `Couldn’t change the download for “${book.title}”. ${error.message}`);
+    if (error.name === "AbortError" && state.accountReady && window.ReaderAccount.current?.scope === scope) {
+      // A cancelled transfer may already have started its atomic IDB commit.
+      // This read queues behind the write so a saved copy is never hidden.
+      await loadSavedBooks().catch(() => {});
+    }
+    if (error.name !== "AbortError" && state.accountReady && window.ReaderAccount.current?.scope === scope) {
+      showError("library-error", error.name === "QuotaExceededError"
+        ? "There isn’t enough space on this device. Remove a download and try again."
+        : `Couldn’t change the download for “${book.title}”. ${error.message}`);
+    }
+    return false;
   } finally {
     state.downloads.delete(book.id);
-    renderLibrary();
+    if (state.accountReady && window.ReaderAccount.current?.scope === scope) renderLibrary();
   }
 }
 
@@ -227,7 +295,7 @@ async function refreshLibrary() {
     renderLibrary();
     const readable = data.books.filter((book) => book.readable).length;
     el("library-status").textContent = window.ReaderAccount.current?.mode === "cloud"
-      ? `${data.books.length} books in your private library. Library refreshed just now.`
+      ? `${data.books.length} books in your private library. ${data.transferReady ? "Your Mac is ready to send books." : "Start transfers on your Mac to save books here."}`
       : `${readable} available on Mac. Updated from Apple Books just now.`;
     showError("library-error", "");
     syncBackups().catch(() => {});
@@ -737,8 +805,13 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") flushOnHide();
   else if (!state.detail && !state.opening) refreshLibrary();
 });
-window.addEventListener("pagehide", flushOnHide);
+window.addEventListener("pagehide", () => { flushOnHide(); cancelDownloads(); });
+function cancelDownloads() {
+  for (const download of state.downloads.values()) download.controller.abort();
+}
+window.addEventListener("books-session-expired", cancelDownloads);
 window.addEventListener("books-account-changing", () => {
+  cancelDownloads();
   state.accountReady = false;
   state.ready = false;
 });

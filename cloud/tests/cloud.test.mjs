@@ -258,3 +258,121 @@ test('linking a replacement Mac revokes the old writer and supersedes old unclai
   assert.equal(devices.length, 2); assert.equal(devices.filter((device) => !device.revokedAt).length, 1);
   assert.equal((await call('/api/books/BOOK1', { cookie: alice.cookie })).body.title, 'New Mac');
 });
+
+const connection = (type = 'offer', extraLines = []) => ({ type, sdp: [
+  'v=0', 'o=- 123456789 2 IN IP4 127.0.0.1', 's=-', 't=0 0',
+  'a=group:BUNDLE 0', 'a=msid-semantic: WMS',
+  'm=application 9 UDP/DTLS/SCTP webrtc-datachannel', 'c=IN IP4 0.0.0.0',
+  'a=mid:0', 'a=ice-ufrag:abcdefghijkl', 'a=ice-pwd:abcdefghijklmnopqrstuvwxyz',
+  `a=fingerprint:sha-256 ${Array(32).fill('AB').join(':')}`,
+  `a=setup:${type === 'offer' ? 'actpass' : 'active'}`, 'a=sctp-port:5000', 'a=max-message-size:262144',
+  'a=candidate:1234 1 udp 2122260223 12345678-abcd.local 54000 typ host generation 0 network-cost 10',
+  'a=end-of-candidates', ...extraLines, '',
+].join('\r\n') });
+const receiveTransfers = (credential) => call('/api/companion/transfers', { bearer: credential, originHeader: null });
+const startTransfer = (cookie, body = { bookId: 'BOOK1', offer: connection() }, options = {}) => call('/api/transfers', { cookie, body, ...options });
+const answerTransfer = (credential, id, body = { answer: connection('answer') }) => call(`/api/companion/transfers/${id}`, { bearer: credential, originHeader: null, body });
+
+async function transferFixture() {
+  const alice = await login();
+  const mac = await pair(alice.cookie);
+  await push(mac.credential);
+  await receiveTransfers(mac.credential);
+  return { alice, mac };
+}
+
+test('direct-transfer signaling is account/device scoped and never exposes the offer to another reader', async () => {
+  const { alice, mac } = await transferFixture();
+  const bob = await login('bob@example.test'), otherMac = await pair(bob.cookie);
+  assert.equal((await call('/api/library', { cookie: alice.cookie })).body.transferReady, true);
+  assert.equal((await call('/api/devices', { cookie: alice.cookie })).body.devices[0].transferReady, true);
+  const created = await startTransfer(alice.cookie);
+  assert.equal(created.status, 200, JSON.stringify(created.body));
+  const id = created.body.id;
+  assert.equal((await startTransfer(bob.cookie)).status, 404);
+  assert.equal((await call(`/api/transfers/${id}`)).status, 401);
+  assert.equal((await call(`/api/transfers/${id}`, { cookie: bob.cookie })).status, 404);
+  assert.equal((await call(`/api/transfers/${id}`, { cookie: bob.cookie, accountHeader: alice.session.user.id })).status, 401);
+  assert.deepEqual((await receiveTransfers(otherMac.credential)).body.transfers, []);
+  assert.equal((await answerTransfer(otherMac.credential, id)).status, 404);
+  assert.equal((await call(`/api/transfers/${id}/close`, { cookie: bob.cookie, body: {} })).status, 200);
+  const pending = (await receiveTransfers(mac.credential)).body.transfers;
+  assert.equal(pending.length, 1); assert.equal(pending[0].id, id); assert.equal(pending[0].bookId, 'BOOK1');
+  assert.deepEqual(pending[0].offer, connection());
+  const waiting = (await call(`/api/transfers/${id}`, { cookie: alice.cookie })).body;
+  assert.equal(waiting.status, 'waiting'); assert.equal(waiting.answer, null); assert.equal(waiting.offer, undefined);
+  assert.equal((await answerTransfer(mac.credential, id)).status, 200);
+  const answered = await call(`/api/transfers/${id}`, { cookie: alice.cookie });
+  assert.equal(answered.response.headers.get('cache-control'), 'private, no-store');
+  assert.equal(answered.body.status, 'answered'); assert.deepEqual(answered.body.answer, connection('answer'));
+  assert.deepEqual((await receiveTransfers(mac.credential)).body.transfers, []);
+  assert.equal((await answerTransfer(mac.credential, id)).status, 404);
+  assert.equal((await call(`/api/transfers/${id}/close`, { cookie: alice.cookie, body: {} })).status, 200);
+  assert.equal((await call(`/api/transfers/${id}`, { cookie: alice.cookie })).status, 404);
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM books_transfers')).rows[0].count, 0);
+});
+
+test('transfers need a fresh sender heartbeat and downloaded EPUB, and enforce bounded expiry and concurrency', async () => {
+  const alice = await login(), mac = await pair(alice.cookie);
+  await push(mac.credential, [book(), book({ id: 'NOT_DOWNLOADED', availableOnMac: false })]);
+  const asleep = await startTransfer(alice.cookie);
+  assert.equal(asleep.status, 503); assert.match(asleep.body.error, /Start transfers on your Mac/);
+  await receiveTransfers(mac.credential);
+  assert.equal((await startTransfer(alice.cookie, { bookId: 'NOT_DOWNLOADED', offer: connection() })).status, 409);
+  const created = await Promise.all([startTransfer(alice.cookie), startTransfer(alice.cookie), startTransfer(alice.cookie), startTransfer(alice.cookie)]);
+  assert.deepEqual(created.map((x) => x.status).sort(), [200, 200, 200, 429]);
+  const id = created.find((x) => x.status === 200).body.id;
+  time += 30_001;
+  assert.equal((await call('/api/library', { cookie: alice.cookie })).body.transferReady, false);
+  assert.equal((await startTransfer(alice.cookie)).status, 503);
+  time += 150_000;
+  assert.equal((await call(`/api/transfers/${id}`, { cookie: alice.cookie })).status, 404);
+  assert.equal((await answerTransfer(mac.credential, id)).status, 404);
+  assert.deepEqual((await receiveTransfers(mac.credential)).body.transfers, []);
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM books_transfers')).rows[0].count, 0);
+  assert.equal((await startTransfer(alice.cookie)).status, 200);
+});
+
+test('revoking or replacing a Mac invalidates its transfer offers, answers, and credentials', async () => {
+  const { alice, mac } = await transferFixture();
+  const first = await startTransfer(alice.cookie);
+  await answerTransfer(mac.credential, first.body.id);
+  await call(`/api/devices/${mac.device.id}/revoke`, { cookie: alice.cookie, body: {} });
+  assert.equal((await receiveTransfers(mac.credential)).status, 401);
+  assert.equal((await answerTransfer(mac.credential, first.body.id)).status, 401);
+  assert.equal((await call(`/api/transfers/${first.body.id}`, { cookie: alice.cookie })).status, 404);
+  assert.equal((await startTransfer(alice.cookie)).status, 503);
+  const second = await pair(alice.cookie); await push(second.credential); await receiveTransfers(second.credential);
+  const pending = await startTransfer(alice.cookie);
+  const replacement = await pair(alice.cookie);
+  assert.equal((await call(`/api/transfers/${pending.body.id}`, { cookie: alice.cookie })).status, 404);
+  assert.deepEqual((await receiveTransfers(replacement.credential)).body.transfers, []);
+  assert.equal((await answerTransfer(replacement.credential, pending.body.id)).status, 404);
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM books_transfers')).rows[0].count, 0);
+});
+
+test('transfer APIs reject files, free-form SDP, media tracks, wrong origins, and mismatched accounts', async () => {
+  const { alice, mac } = await transferFixture();
+  for (const originHeader of [null, 'https://attacker.example']) assert.equal((await startTransfer(alice.cookie, undefined, { originHeader })).status, 403);
+  assert.equal((await startTransfer(alice.cookie, undefined, { accountHeader: 'someone-else' })).status, 401);
+  const malicious = [
+    { bookId: 'BOOK1', offer: connection(), epub: 'base64-file' },
+    { bookId: '../private.epub', offer: connection() },
+    { bookId: 'BOOK1', offer: { ...connection(), epub: 'base64-file' } },
+    { bookId: 'BOOK1', offer: { ...connection(), type: 'answer' } },
+    { bookId: 'BOOK1', offer: { type: 'offer', sdp: 'PK\u0003\u0004file' } },
+    { bookId: 'BOOK1', offer: { type: 'offer', sdp: 'x'.repeat(32769) } },
+    { bookId: 'BOOK1', offer: connection('offer', ['a=x-book-file:encoded-file']) },
+    { bookId: 'BOOK1', offer: connection('offer', ['m=audio 9 UDP/TLS/RTP/SAVPF 111']) },
+    { bookId: 'BOOK1', offer: { ...connection(), sdp: connection().sdp.replace('s=-', 's=encoded-file') } },
+  ];
+  for (const body of malicious) assert.equal((await startTransfer(alice.cookie, body)).status, 400);
+  const created = await startTransfer(alice.cookie), id = created.body.id;
+  for (const body of [{ answer: connection('answer'), error: 'TRANSFER_FAILED' }, { error: 'private file data' }, { answer: connection('offer') }, { error: 'TRANSFER_FAILED', epub: 'bytes' }]) {
+    assert.equal((await answerTransfer(mac.credential, id, body)).status, 400);
+  }
+  assert.equal((await call(`/api/companion/transfers/${id}`, { bearer: mac.credential, body: { answer: connection('answer') } })).status, 403);
+  assert.equal((await answerTransfer(mac.credential, id, { error: 'BOOK_TOO_LARGE' })).status, 200);
+  const failed = (await call(`/api/transfers/${id}`, { cookie: alice.cookie })).body;
+  assert.equal(failed.status, 'failed'); assert.equal(failed.error, 'BOOK_TOO_LARGE'); assert.equal(failed.answer, null);
+});

@@ -2,7 +2,7 @@ import { Pool } from 'pg';
 import { configuration } from './config.mjs';
 import { createAuth } from './auth.mjs';
 import { PostgresStore } from './store.mjs';
-import { HttpError, fields, identifier, jsonBody, position, snapshot, string } from './validation.mjs';
+import { HttpError, fields, identifier, jsonBody, position, snapshot, string, transferRequest, transferAnswer } from './validation.mjs';
 
 export function json(status, body) {
   return Response.json(body, { status, headers: {
@@ -55,6 +55,10 @@ export function createHandler({ store, auth, origin }) {
           return json(200, await store.importSnapshot(device, snapshot(await jsonBody(request, 1_048_576))));
         }
         if (path === '/api/companion/positions' && method === 'GET') return json(200, await store.positions(device));
+        if (path === '/api/companion/transfers' && method === 'GET') return json(200, await store.pendingTransfers(device));
+        const answerMatch = path.match(/^\/api\/companion\/transfers\/([^/]+)$/);
+        if (answerMatch && method === 'POST') return json(200, await store.answerTransfer(device,
+          identifier(decodeURIComponent(answerMatch[1]), 'transfer identifier'), transferAnswer(await jsonBody(request, 40_960))));
         throw new HttpError(404, 'Endpoint not found.');
       }
 
@@ -70,6 +74,16 @@ export function createHandler({ store, auth, origin }) {
       if (path === '/api/library' && method === 'GET') return json(200, await store.library(owner));
       if (path === '/api/devices' && method === 'GET') return json(200, await store.devices(owner));
       if (path === '/api/devices/pairing' && method === 'POST') return json(200, await store.createPairing(owner));
+      if (path === '/api/transfers' && method === 'POST') return json(200, await store.createTransfer(owner, transferRequest(await jsonBody(request, 40_960))));
+      const transferMatch = path.match(/^\/api\/transfers\/([^/]+)(?:\/(close))?$/);
+      if (transferMatch) {
+        const id = identifier(decodeURIComponent(transferMatch[1]), 'transfer identifier');
+        if (!transferMatch[2] && method === 'GET') return json(200, await store.transfer(owner, id));
+        if (transferMatch[2] === 'close' && method === 'POST') {
+          fields(await jsonBody(request), [], 'transfer close');
+          return json(200, await store.closeTransfer(owner, id));
+        }
+      }
       const revokeMatch = path.match(/^\/api\/devices\/([^/]+)\/revoke$/);
       if (revokeMatch && method === 'POST') return json(200, await store.revokeDevice(owner, identifier(decodeURIComponent(revokeMatch[1]), 'device identifier')));
       const bookMatch = path.match(/^\/api\/books\/([^/]+)(?:\/(position))?$/);

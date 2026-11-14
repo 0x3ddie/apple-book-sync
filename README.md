@@ -4,6 +4,8 @@ A browser bookshelf with a local Apple Books bridge and an optional private clou
 
 Hosted preview: [apple-book-sync.vercel.app](https://apple-book-sync.vercel.app/). The production deployment and Neon database are configured. Live email delivery, user-confirmed phone sign-in, Mac pairing, and metadata upload and readback have been verified.
 
+Direct EPUB transfer is implemented with automated sender and signaling tests passing. Full browser and phone transfer/offline-reading checks are still pending.
+
 ## What works locally
 
 - A searchable library with real covers where available, Continue reading, and reading/availability filters.
@@ -15,7 +17,7 @@ Hosted preview: [apple-book-sync.vercel.app](https://apple-book-sync.vercel.app/
 - Page turns save automatically. Done reading waits for a save before returning to the library. Unsent positions have a browser-local backup; hiding/leaving the page also attempts a keepalive save.
 - Changes in both Books and the web reader prompt a position choice. Per-book revisions and session sequences protect against stale requests and competing tabs.
 
-**Saving in the web reader does not update Apple Books automatically.** The manual Open this position in Apple Books link works on the Mac. Automatic position application, direct EPUB transfer to Android, and iPad propagation are not implemented or verified. The Python preview binds only to `127.0.0.1`; the local preview itself is not phone-accessible. The hosted app supports verified phone sign-in and private library metadata sync from a paired Mac.
+**Saving in the web reader does not update Apple Books automatically.** The manual Open this position in Apple Books link works on the Mac. Automatic position application and iPad propagation are not implemented or verified. The Python preview binds only to `127.0.0.1`; the local preview itself is not phone-accessible. Use the hosted app and the direct-transfer command below to prepare books on another device.
 
 Only downloaded, readable, DRM-free EPUBs can open. iCloud placeholders appear in the library with instructions to download them in Books first; listing the library does not intentionally hydrate cloud files. Annotations are imported read-only. Changes made here are not written into Apple’s databases.
 
@@ -34,7 +36,7 @@ The Mac bridge saves positions in `.local/reader.sqlite3` and packages requested
 
 ## Email login and private cloud service
 
-The first login provider is an email sign-in link. Better Auth handles sessions and single-use, ten-minute links; Resend delivers email. A Postgres database stores accounts, device registrations, library metadata, imported annotations, and web reading positions. There are no cloud EPUB/cover upload or download endpoints.
+The first login provider is an email sign-in link. Better Auth handles sessions and single-use, ten-minute links; Resend delivers email. A Postgres database stores accounts, device registrations, library metadata, imported annotations, web reading positions, and short-lived WebRTC connection descriptions. There are no cloud EPUB/cover upload or download endpoints.
 
 Every private request verifies the server session and scopes database queries to its owner. An expected-account header also prevents an old tab from using a newly switched account's cookie. Browser databases and pending positions are scoped by account. Signing out removes downloads; any drafts created concurrently in another tab remain associated with their original owner. Definitive authentication failure locks the reader; network failure permits the previously signed-in account to read its local copies.
 
@@ -48,7 +50,7 @@ The Vercel deployment is live at [apple-book-sync.vercel.app](https://apple-book
 
 ## Download and pair the Mac companion
 
-The web app and Mac companion are both in this repository. The companion is currently a Python command-line program, not a packaged macOS app or an Apple Books extension. It requires macOS, Git, and Python 3.9+; it uses only Python's standard library, so running the companion does not require Node.js, npm, or a separate `pip install`.
+The web app and Mac companion are both in this repository. The companion is currently a Python command-line program, not a packaged macOS app or an Apple Books extension. Pairing and metadata sync require macOS, Git, and Python 3.9+ and use only Python's standard library. Direct EPUB transfers require Python 3.11+ and the separate dependencies installed by the script below. Neither companion mode needs Node.js or npm.
 
 Download the project in Terminal:
 
@@ -71,6 +73,22 @@ Paste the pairing code at the hidden terminal prompt. It expires after ten minut
 
 `sync` performs one outbound metadata sync. It uploads titles, identifiers, saved Apple positions, and annotations, then checks pending web positions. It does not upload EPUBs/covers, modify Books, or open external URLs. Credentials are stored in `.local/companion.json` with permissions `0600`; this prototype does not yet use Keychain. Use `python3 companion.py status` to see the pairing, and **Unlink** on the website to revoke access. `python3 companion.py unpair` removes the local credential only.
 
+## Save selected books on your phone
+
+After pairing the Mac, connect the Mac and phone to the same Wi-Fi. On the Mac, run:
+
+```sh
+./scripts/start-transfers.sh
+```
+
+The script creates an isolated, git-ignored environment at `.local/transfer-venv` and installs `aiortc==1.16.0` and its dependencies from PyPI. It needs Python 3.11 or newer. Transfers stay available for 30 minutes by default; use `./scripts/start-transfers.sh --minutes 60` to choose a window from 1 to 480 minutes. Keep the Mac awake and the command running; Control-C stops it. The command syncs library metadata when it starts and once a minute while running.
+
+On the phone, sign in to the hosted app, tap **Refresh library**, then choose **Save offline** for each book you want. The EPUB must already be downloaded and readable in Apple Books on the Mac. Wait until the app confirms that the book is saved, then open it or find it under **Saved on this device**. You can remove each browser copy with **Remove download**. Cloud transfers copy the EPUB only; separate cover-image files are not transferred, so the shelf may use text covers.
+
+The browser and Mac exchange authenticated, account-bound connection offers and answers through Vercel. Each offer expires after three minutes. The EPUB then travels over an encrypted WebRTC data channel directly between the devices. Neither STUN nor TURN servers are configured, and Vercel never receives or stores the EPUB bytes. Networks that isolate Wi-Fi clients can prevent the direct connection; there is no relay fallback.
+
+The receiver checks the file size and SHA-256 digest before saving the EPUB in that account's browser IndexedDB. It acknowledges success only after the save completes. Transfers are limited to 128 MiB per EPUB. Keep the phone page open until saving finishes; an interrupted transfer can be retried. Once saved, the book and cached reader shell are available without the Mac or an internet connection, subject to browser storage availability.
+
 ## Sync limits
 
 The intended full flow is:
@@ -81,7 +99,7 @@ Android web reader ↔ private server ↔ Mac companion ↔ Apple Books ↔ iClo
 
 The local bridge reads Books data and stores web progress, plus manual return links. The new companion and cloud APIs carry metadata and pending web positions; they do not apply those positions to Books. Automatic application still needs implementation and verification that Books actually saved the passage. A sent request or a clicked link alone must never be labeled as confirmed sync.
 
-EPUB transfer is a separate path. To keep file bytes off Vercel, the intended next step is direct Mac-to-phone transfer while preparing downloads, initially on the same Wi-Fi, followed by offline browser storage. Pairing and metadata sync alone do not make a book file appear on the phone. No direct-transfer transport is implemented yet.
+EPUB transfer uses the separate direct path described above. Pairing and metadata sync alone do not copy book files: the Mac must be offering transfers, and the reader must select **Save offline** for each book. There is no cloud file storage or automatic bulk download.
 
 The Mac must be awake and online to send fresh Apple Books changes. The cloud service retains pending web changes while the Mac is unavailable. The companion currently runs on demand, with no background scheduler. Books may not flush its current reading position to disk immediately.
 
@@ -105,8 +123,11 @@ Books saved a page-aligned position rather than the browser’s exact character 
 python3 -m unittest discover -s tests -v
 python3 -m py_compile library.py serve.py prepare.py
 node --check public/reader.js
+node --test tests/transfer.test.mjs
 npm run test:cloud
 npm run build
 ```
 
-Python tests use temporary Books-like databases and EPUB fixtures. They cover per-book persistence, out-of-order saves, competing readers, Apple-position conflicts, invalid input, EPUB/annotation import, iCloud placeholders, HTTP Host/Origin checks, metadata-only companion payloads, credentials, and batching. Cloud tests exercise real Better Auth and PostgreSQL via PGlite, including email-link redemption, user isolation, account switching, pairing expiry/replay/revocation, and position conflicts. Tests do not modify the real Apple Books library or send real emails.
+After installing transfer dependencies, run `.local/transfer-venv/bin/python -m unittest discover -s tests -v` to include the real WebRTC peer tests. Without those dependencies, the direct-transfer Python tests are skipped.
+
+Python tests use temporary Books-like databases and EPUB fixtures. They cover per-book persistence, out-of-order saves, competing readers, Apple-position conflicts, invalid input, EPUB/annotation import, iCloud placeholders, HTTP Host/Origin checks, metadata-only companion payloads, credentials, and batching. Three direct-transfer tests pass using real WebRTC peers. The 14 cloud tests exercise real Better Auth and PostgreSQL via PGlite, including account isolation, pairing, position conflicts, and transfer signaling expiry/replay/revocation and payload restrictions. Tests do not modify the real Apple Books library or send real emails. Automated peer and signaling checks do not replace the pending full browser/phone offline-reading check.

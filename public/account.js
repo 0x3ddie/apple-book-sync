@@ -46,7 +46,7 @@ window.ReaderAccount = (() => {
     if (account.mode === "cloud") {
       document.querySelector(".local-label").textContent = offline ? "Offline library" : "Private library";
       get("refresh").textContent = "Refresh library";
-      document.querySelector(".library-footer").textContent = "Your account keeps library details and reading positions private. Books stay on this device. Direct transfer from your Mac is still being built.";
+      document.querySelector(".library-footer").textContent = "Choose Save offline to copy a book directly from your Mac over the same Wi-Fi. Keep transfers running on your Mac until saving finishes. Saved EPUBs stay on this device, not on Vercel.";
     }
     unlock(current);
   }
