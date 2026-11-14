@@ -8,7 +8,7 @@
     "test:cloud": "node --test cloud/tests/*.test.mjs",
     "migrate:cloud": "node cloud/migrate.mjs"
   },
-  "engines": { "node": ">=22" },
+  "engines": { "node": "22.x" },
   "dependencies": {
     "better-auth": "1.7.23",
     "epubjs": "0.3.93",

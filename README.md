@@ -17,7 +17,7 @@ A browser bookshelf with a local Apple Books bridge and an optional private clou
 
 Only downloaded, readable, DRM-free EPUBs can open. iCloud placeholders appear in the library with instructions to download them in Books first; listing the library does not intentionally hydrate cloud files. Annotations are imported read-only. Changes made here are not written into Apple’s databases.
 
-## Run
+## Run the local web preview
 
 Requires macOS with Apple Books, Python 3.9+, Node.js 22+, and npm. The terminal or host app needs permission to read Books app data.
 
@@ -44,9 +44,21 @@ To configure a deployment:
 
 No live delivery or Vercel deployment has been verified. Tests capture emails in memory. The Vercel connection currently needs team authorization before resources can be inspected or configured.
 
-## Pair the Mac companion
+## Download and pair the Mac companion
 
-Once cloud sign-in is configured, sign in, open **Linked Macs**, and create a pairing code. In a terminal on your Mac:
+The web app and Mac companion are both in this repository. The companion is currently a Python command-line program, not a packaged macOS app or an Apple Books extension. It requires macOS, Git, and Python 3.9+; it uses only Python's standard library, so running the companion does not require Node.js, npm, or a separate `pip install`.
+
+Download the project in Terminal:
+
+```sh
+git clone https://github.com/0x3ddie/apple-book-sync.git
+cd apple-book-sync
+python3 companion.py --help
+```
+
+If you already cloned the repository, open its folder instead of cloning it again. Open Apple Books on the Mac with your library, and allow the terminal or host app to read Books data if macOS prompts.
+
+Once cloud sign-in is configured, sign in to the website, open **Linked Macs**, and create a pairing code. Replace `https://YOUR-DOMAIN` with the hosted website's address, then run:
 
 ```sh
 python3 companion.py pair --server https://YOUR-DOMAIN --name "My Mac"
