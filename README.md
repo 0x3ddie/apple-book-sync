@@ -10,7 +10,7 @@ Direct EPUB transfer is deployed and verified in signed-in Chrome against the li
 
 - A searchable library with real covers where available, Continue reading, and reading/availability filters.
 - **Save offline**, **Remove download**, and **Saved on this device** let you select individual EPUBs. Selected files, covers, and imported annotations live in this browser's IndexedDB. The service worker saves only the public reader shell and its dependencies.
-- Saved books open after a full page reload with the Mac service stopped. Offline page turns survive returning to the shelf and reloading; queued positions retry when connected. Removing a download leaves the Apple Books original untouched.
+- Completed downloads survive closing the tab or browser and open after a full page reload with the Mac service stopped. Offline page turns survive returning to the shelf and reloading; queued positions retry when connected. Removing a download leaves the Apple Books original untouched.
 - EPUB reading, page turns, touch swipes, and keyboard navigation.
 - Apple Books highlights drawn inline, plus a list of highlights, notes, and bookmarks that links to their passages.
 - Opening a book reads its saved Apple Books position. A pending web position takes precedence so returning to the app does not lose web progress.
@@ -37,6 +37,8 @@ The Mac bridge saves positions in `.local/reader.sqlite3` and packages requested
 ## Email login and private cloud service
 
 The first login provider is an email sign-in link. Better Auth handles sessions and single-use, ten-minute links; Resend delivers email. A Postgres database stores accounts, device registrations, library metadata, imported annotations, web reading positions, and short-lived WebRTC connection descriptions. There are no cloud EPUB/cover upload or download endpoints.
+
+The browser keeps the login across tab and browser closes. Sessions last 30 days and renew at most once a day during active use. Private browsing, clearing site data, or an expired/revoked session can require another sign-in. Each device has its own browser session; the Mac companion's pairing is separate and stays valid until it is unlinked, replaced, or locally unpaired.
 
 Every private request verifies the server session and scopes database queries to its owner. An expected-account header also prevents an old tab from using a newly switched account's cookie. Browser databases and pending positions are scoped by account. Signing out removes downloads; any drafts created concurrently in another tab remain associated with their original owner. Definitive authentication failure locks the reader; network failure permits the previously signed-in account to read its local copies.
 
@@ -71,7 +73,7 @@ python3 companion.py sync
 
 Paste the pairing code at the hidden terminal prompt. It expires after ten minutes and can be used once. One Mac companion is active per account in this version; linking a replacement revokes the previous credential. The website shows registered Macs and their last contact time—it does not silently detect installations.
 
-`sync` performs one outbound metadata sync. It uploads titles, identifiers, saved Apple positions, and annotations, then checks pending web positions. It does not upload EPUBs/covers, modify Books, or open external URLs. Credentials are stored in `.local/companion.json` with permissions `0600`; this prototype does not yet use Keychain. Use `python3 companion.py status` to see the pairing, and **Unlink** on the website to revoke access. `python3 companion.py unpair` removes the local credential only.
+`sync` performs one outbound metadata sync. It uploads titles, identifiers, saved Apple positions, and annotations, then checks pending web positions. It does not upload EPUBs/covers, modify Books, or open external URLs. Credentials are stored in `~/Library/Application Support/Apple Books Companion/.local/companion.json` with permissions `0600`; this prototype does not yet use Keychain. Existing checkout-local credentials migrate there on the next companion command or background installation. Use `python3 companion.py status` to see the pairing, and **Unlink** on the website to revoke access. `python3 companion.py unpair` removes the local credential only.
 
 ## Save selected books on your phone
 
@@ -83,11 +85,28 @@ After pairing the Mac, connect the Mac and phone to the same Wi-Fi. On the Mac, 
 
 The script creates an isolated, git-ignored environment at `.local/transfer-venv` and installs `aiortc==1.16.0` and its dependencies from PyPI. It needs Python 3.11 or newer. Transfers stay available for 30 minutes by default; use `./scripts/start-transfers.sh --minutes 60` to choose a window from 1 to 480 minutes. Keep the Mac awake and the command running; Control-C stops it. The command syncs library metadata when it starts and once a minute while running.
 
+To keep the paired companion running automatically, let that first command finish installing its dependencies, stop it with **Control-C**, then run:
+
+```sh
+python3 background.py install
+python3 background.py status
+```
+
+This copies the required companion files and Python environment into `~/Library/Application Support/Apple Books Companion`, installs a per-user macOS LaunchAgent, and starts the companion immediately. It starts again when you log into this Mac and restarts after failures. No Terminal window needs to remain open, and the installed service does not depend on the original checkout staying in place. Run `python3 background.py install` again from an updated checkout to refresh the installed copy; pairing and saved progress are kept. The background process checks local library metadata once a minute and uploads it only when it changes. It polls for transfers every 20 seconds while idle and every 5 seconds during a transfer.
+
+For new downloads, keep the Mac awake, logged in, and online, with the phone on the same Wi-Fi. On its first background launch, macOS may ask to let **Python** access data from other apps; allow that request so the companion can read Apple Books. Permission granted to Terminal or a development app does not automatically cover the background process. Logs are in `~/Library/Application Support/Apple Books Companion/.local/companion-background.log`. To stop it and remove automatic startup:
+
+```sh
+python3 background.py uninstall
+```
+
+Uninstalling the background service keeps the Mac pairing, the Apple Books library, and books already saved on your phone.
+
 On the phone, sign in to the hosted app, tap **Refresh library**, then choose **Save offline** for each book you want. The EPUB must already be downloaded and readable in Apple Books on the Mac. Wait until the app confirms that the book is saved, then open it or find it under **Saved on this device**. You can remove each browser copy with **Remove download**. Cloud transfers copy the EPUB only; separate cover-image files are not transferred, so the shelf may use text covers.
 
 The browser and Mac exchange authenticated, account-bound connection offers and answers through Vercel. Each offer expires after three minutes. The EPUB then travels over an encrypted WebRTC data channel directly between the devices. Neither STUN nor TURN servers are configured, and Vercel never receives or stores the EPUB bytes. Networks that isolate Wi-Fi clients can prevent the direct connection; there is no relay fallback.
 
-The receiver checks the file size and SHA-256 digest before saving the EPUB in that account's browser IndexedDB. It acknowledges success only after the save completes. Transfers are limited to 128 MiB per EPUB. Keep the phone page open until saving finishes; an interrupted transfer can be retried. Once saved, the book and cached reader shell are available without the Mac or an internet connection, subject to browser storage availability.
+The receiver checks the file size and SHA-256 digest before saving the EPUB in that account's browser IndexedDB. It acknowledges success only after the save completes. Transfers are limited to 128 MiB per EPUB. Keep the phone page open until saving finishes; an interrupted transfer can be retried. Once saved, the book and cached reader shell survive tab/browser closes and are available without the Mac or an internet connection, subject to browser storage availability. Signing out or clearing site data removes the browser copies; the browser can also evict them under storage pressure.
 
 ## Sync limits
 
@@ -101,7 +120,7 @@ The local bridge reads Books data and stores web progress, plus manual return li
 
 EPUB transfer uses the separate direct path described above. Pairing and metadata sync alone do not copy book files: the Mac must be offering transfers, and the reader must select **Save offline** for each book. There is no cloud file storage or automatic bulk download.
 
-The Mac must be awake and online to send fresh Apple Books changes. The cloud service retains pending web changes while the Mac is unavailable. The companion currently runs on demand, with no background scheduler. Books may not flush its current reading position to disk immediately.
+The Mac must be awake and online to send fresh Apple Books changes. The cloud service retains pending web changes while the Mac is unavailable. The companion can run on demand or automatically as the login service described above. Books may not flush its current reading position to disk immediately.
 
 Exit-only syncing is unreliable on mobile because the operating system can terminate a browser without an exit event. Regular saves and local backups carry the main responsibility; the hidden-page save is best effort. [Browser lifecycle guidance](https://developer.chrome.com/docs/web-platform/page-lifecycle-api)
 
@@ -121,7 +140,7 @@ Books saved a page-aligned position rather than the browser’s exact character 
 
 ```sh
 python3 -m unittest discover -s tests -v
-python3 -m py_compile library.py serve.py prepare.py
+python3 -m py_compile library.py serve.py prepare.py companion.py transfer.py background.py
 node --check public/reader.js
 node --test tests/transfer.test.mjs
 npm run test:cloud
@@ -130,4 +149,4 @@ npm run build
 
 After installing transfer dependencies, run `.local/transfer-venv/bin/python -m unittest discover -s tests -v` to include the real WebRTC peer tests. Without those dependencies, the direct-transfer Python tests are skipped.
 
-Python tests use temporary Books-like databases and EPUB fixtures. They cover per-book persistence, out-of-order saves, competing readers, Apple-position conflicts, invalid input, EPUB/annotation import, iCloud placeholders, HTTP Host/Origin checks, metadata-only companion payloads, credentials, and batching. Three direct-transfer tests pass using real WebRTC peers. The 14 cloud tests exercise real Better Auth and PostgreSQL via PGlite, including account isolation, pairing, position conflicts, and transfer signaling expiry/replay/revocation and payload restrictions. Tests do not modify the real Apple Books library or send real emails. The 12 browser protocol/storage tests cover validation, cancellation, account changes, and acknowledgment after durable storage. A Chrome UI check verified real direct transfer through production; an isolated EPUB fixture verified full reload and saved-position persistence with its server stopped. No Android device was automated.
+Python tests use temporary Books-like databases and EPUB fixtures. They cover per-book persistence, out-of-order saves, competing readers, Apple-position conflicts, invalid input, EPUB/annotation import, iCloud placeholders, HTTP Host/Origin checks, metadata-only companion payloads, credentials, and batching. Background-service tests use mocked launchctl commands to check safe installation, matching-service replacement, and uninstalling without deleting pairing. Direct-transfer tests use real WebRTC peers. Cloud tests exercise real Better Auth and PostgreSQL via PGlite, including account isolation, pairing, position conflicts, and transfer signaling expiry/replay/revocation and payload restrictions. Tests do not modify the real Apple Books library or send real emails. Browser protocol/storage tests cover validation, cancellation, account changes, and acknowledgment after durable storage. A Chrome UI check verified real direct transfer through production; an isolated EPUB fixture verified full reload and saved-position persistence with its server stopped. No Android device was automated.

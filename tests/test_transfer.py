@@ -1,15 +1,20 @@
 import asyncio
+import contextlib
 import hashlib
+import io
 import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+from companion import CompanionError, write_config
 
 try:
     from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
-    from transfer import CHANNEL, MAX_EPUB_BYTES, serve_offer
+    from transfer import CHANNEL, MAX_EPUB_BYTES, serve_offer, serve_transfers, service_lock
     HAS_WEBRTC = True
 except ImportError:
     HAS_WEBRTC = False
@@ -95,6 +100,104 @@ class DirectTransferTest(unittest.IsolatedAsyncioTestCase):
                                   self.library, client)
         self.assertFalse(result)
         self.assertEqual(calls, [("POST", "/api/companion/transfers/transfer-two", {"error": "BOOK_TOO_LARGE"})])
+
+
+@unittest.skipUnless(HAS_WEBRTC, "Run with .local/transfer-venv/bin/python for direct-transfer checks")
+class TransferServiceTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.path = Path(self.temporary.name) / ".local/companion.json"
+        write_config({"server": "https://reader.example", "deviceId": "device-one",
+                      "credential": "device_" + "a" * 43, "sequence": 1000}, self.path)
+        self.client = Mock()
+        self.client.request.return_value = {"transfers": []}
+        self.metadata_sync = Mock(return_value={"changed": False, "books": 1})
+        self.clock = 0
+        self.waits = []
+        real_sleep = asyncio.sleep
+
+        async def sleep(seconds):
+            self.waits.append(seconds)
+            self.clock += seconds
+            if len(self.waits) > 20:
+                raise AssertionError("The transfer loop did not stop as expected")
+            await real_sleep(0)
+
+        async def in_thread(function, *args, **kwargs):
+            return function(*args, **kwargs)
+
+        self.enterContext(patch("transfer.time", SimpleNamespace(monotonic=lambda: self.clock)))
+        self.enterContext(patch("transfer.asyncio.sleep", side_effect=sleep))
+        self.enterContext(patch("transfer.asyncio.to_thread", side_effect=in_thread))
+        self.enterContext(patch("transfer.SyncClient", return_value=self.client))
+        self.library = self.enterContext(patch("transfer.BooksLibrary")).return_value
+        self.enterContext(patch("transfer.sync", self.metadata_sync))
+        self.enterContext(contextlib.redirect_stdout(io.StringIO()))
+
+    def test_service_lock_blocks_a_duplicate_and_releases_after_error(self):
+        with self.assertRaisesRegex(RuntimeError, "simulated stop"):
+            with service_lock(self.path):
+                with self.assertRaisesRegex(CompanionError, "already offering"):
+                    with service_lock(self.path):
+                        self.fail("A duplicate sender acquired the lock")
+                raise RuntimeError("simulated stop")
+        with service_lock(self.path):
+            self.assertEqual(self.path.with_name("transfer-service.lock").stat().st_mode & 0o777, 0o600)
+
+    async def test_background_retries_network_failure_at_idle_interval_and_outlives_duration(self):
+        self.client.request.side_effect = [CompanionError("Network unavailable"),
+                                           *[{"transfers": []} for _ in range(4)],
+                                           CompanionError("Unlinked", status=401)]
+        await serve_transfers(minutes=1, path=self.path, background=True)
+        self.assertEqual(self.waits, [20] * 5)
+        self.assertGreater(self.clock, 60)
+        self.assertEqual(self.client.request.call_count, 6)
+        self.assertEqual(self.metadata_sync.call_count, 2)
+        self.metadata_sync.assert_called_with(self.path, self.library, self.client,
+                                              skip_unchanged=True, quiet=True)
+
+    async def test_background_revocation_stops_cleanly_and_cancels_active_transfers(self):
+        for status in (401, 403):
+            with self.subTest(status=status):
+                started = asyncio.Event()
+                stopped = asyncio.Event()
+
+                async def pending_transfer(*args):
+                    started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        stopped.set()
+
+                self.client.request.side_effect = [{"transfers": [{"id": "active-transfer"}]},
+                                                   CompanionError("Unlinked", status=status)]
+                with patch("transfer.serve_offer", side_effect=pending_transfer):
+                    await serve_transfers(path=self.path, background=True)
+                self.assertTrue(started.is_set())
+                self.assertTrue(stopped.is_set())
+                self.assertEqual(self.waits[-1], 5)
+                # Clean shutdown also releases the sender lock.
+                with service_lock(self.path):
+                    pass
+
+    async def test_foreground_window_remains_bounded(self):
+        await serve_transfers(minutes=1, path=self.path)
+        self.assertEqual(self.clock, 60)
+        self.assertEqual(self.waits, [5] * 12)
+        self.assertEqual(self.client.request.call_count, 12)
+        self.metadata_sync.assert_called_once_with(self.path, self.library, self.client,
+                                                   skip_unchanged=False, quiet=False)
+
+    async def test_unpaired_background_start_exits_without_polling_or_creating_lock(self):
+        self.path.unlink()
+        await serve_transfers(path=self.path, background=True)
+        self.client.request.assert_not_called()
+        self.metadata_sync.assert_not_called()
+        self.assertFalse(self.path.with_name("transfer-service.lock").exists())
+        self.assertEqual(self.waits, [])
+        with self.assertRaisesRegex(CompanionError, "not paired"):
+            await serve_transfers(path=self.path)
 
 
 if __name__ == "__main__":

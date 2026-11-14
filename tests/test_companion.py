@@ -7,9 +7,9 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from companion import (CompanionError, MAX_BODY, SyncClient, encode, metadata_book,
+from companion import (CompanionError, MAX_BODY, SyncClient, encode, metadata_book, migrate_legacy_config,
                        read_config, server_origin, snapshot_batches, sync, write_config)
 
 
@@ -92,6 +92,37 @@ class CompanionTest(unittest.TestCase):
         with self.assertRaisesRegex(CompanionError, "0600"):
             read_config(self.path)
 
+    def test_legacy_migration_preserves_private_pairing_and_is_idempotent(self):
+        source = Path(self.temporary.name) / "checkout/.local/companion.json"
+        write_config(self.config, source)
+        migrate_legacy_config(source, self.path)
+        self.assertEqual(read_config(self.path), self.config)
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.path.parent.stat().st_mode & 0o777, 0o700)
+        self.assertFalse(source.exists())
+        migrated_bytes = self.path.read_bytes()
+        migrate_legacy_config(source, self.path)
+        migrate_legacy_config(self.path, self.path)
+        self.assertEqual(self.path.read_bytes(), migrated_bytes)
+
+    def test_legacy_migration_never_replaces_an_existing_identity(self):
+        source = Path(self.temporary.name) / "checkout/.local/companion.json"
+        existing = dict(self.config, deviceId="existing-device", credential="device_" + "b" * 43)
+        write_config(self.config, source)
+        write_config(existing, self.path)
+        migrate_legacy_config(source, self.path)
+        self.assertEqual(read_config(self.path), existing)
+        self.assertEqual(read_config(source), self.config)
+
+    def test_failed_migration_keeps_the_original_pairing(self):
+        source = Path(self.temporary.name) / "checkout/.local/companion.json"
+        write_config(self.config, source)
+        with patch("companion.write_config", side_effect=OSError("Disk full")):
+            with self.assertRaisesRegex(OSError, "Disk full"):
+                migrate_legacy_config(source, self.path)
+        self.assertEqual(read_config(source), self.config)
+        self.assertFalse(self.path.exists())
+
     def test_batches_respect_byte_and_book_limits_without_losing_books(self):
         book = metadata_book(fixture_book())
         books = [dict(book, id=str(index)) for index in range(405)]
@@ -146,6 +177,50 @@ class CompanionTest(unittest.TestCase):
         self.assertIn("1 web positions", output.getvalue())
         self.assertNotIn("private", output.getvalue())
         self.assertNotIn(self.config["credential"], output.getvalue())
+
+    def test_background_sync_skips_all_cloud_requests_until_metadata_changes(self):
+        write_config(self.config, self.path)
+        detail = fixture_book()
+        library = Mock()
+        library.list_books.return_value = {"books": [{"id": detail["id"]}]}
+        library.book.return_value = detail
+        client = Mock()
+        client.request.side_effect = lambda method, *args: {"positions": []} if method == "GET" else {"ok": True}
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(sync(self.path, library, client, skip_unchanged=True, quiet=True),
+                             {"changed": True, "books": 1})
+            self.assertEqual(client.request.call_count, 2)
+            first_hash = read_config(self.path)["snapshotHash"]
+            client.reset_mock()
+            self.assertEqual(sync(self.path, library, client, skip_unchanged=True, quiet=True),
+                             {"changed": False, "books": 1})
+            client.request.assert_not_called()
+            detail["annotations"][0]["note"] = "A changed note"
+            self.assertEqual(sync(self.path, library, client, skip_unchanged=True, quiet=True),
+                             {"changed": True, "books": 1})
+            self.assertEqual(client.request.call_count, 2)
+            self.assertNotEqual(read_config(self.path)["snapshotHash"], first_hash)
+            self.assertEqual(output.getvalue(), "")
+
+    def test_failed_snapshot_is_retried_instead_of_cached(self):
+        write_config(self.config, self.path)
+        library = Mock()
+        library.list_books.return_value = {"books": [{"id": "book-one"}]}
+        library.book.return_value = fixture_book()
+        client = Mock()
+        client.request.side_effect = [CompanionError("Connection interrupted"), {"ok": True}, {"positions": []}]
+        with self.assertRaisesRegex(CompanionError, "Connection interrupted"):
+            sync(self.path, library, client, skip_unchanged=True, quiet=True)
+        failed_sequence = read_config(self.path)["sequence"]
+        self.assertNotIn("snapshotHash", read_config(self.path))
+        self.assertEqual(sync(self.path, library, client, skip_unchanged=True, quiet=True),
+                         {"changed": True, "books": 1})
+        requests = client.request.call_args_list
+        self.assertEqual([call.args[:2] for call in requests],
+                         [("POST", "/api/companion/snapshot"), ("POST", "/api/companion/snapshot"),
+                          ("GET", "/api/companion/positions")])
+        self.assertGreater(requests[1].args[2]["sequence"], failed_sequence)
+        self.assertIn("snapshotHash", read_config(self.path))
 
 
 if __name__ == "__main__":

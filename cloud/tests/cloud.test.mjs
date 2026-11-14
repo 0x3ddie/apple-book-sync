@@ -65,6 +65,7 @@ async function login(email = 'alice@example.test') {
   assert.equal(result.status, 302);
   const sessionCookie = result.headers.getSetCookie().find((value) => value.includes('session_token='));
   assert.match(sessionCookie, /; Secure/i); assert.match(sessionCookie, /; HttpOnly/i); assert.match(sessionCookie, /; SameSite=Lax/i);
+  assert.match(sessionCookie, /; Max-Age=2592000(?:;|$)/i);
   const cookie = result.headers.getSetCookie().map((value) => value.split(';')[0]).join('; ');
   assert.ok(cookie.includes('session_token='));
   const session = (await call('/api/session', { cookie })).body;
@@ -135,6 +136,38 @@ test('real Better Auth email link creates a secure session and is single-use', a
   const logout = await call('/api/auth/sign-out', { cookie: user.cookie, body: {} });
   assert.equal(logout.status, 200);
   assert.equal((await call('/api/session', { cookie: user.cookie })).status, 401);
+});
+
+test('active sessions renew the persistent browser cookie on private routes and route errors', async () => {
+  const user = await login();
+  for (const [path, status] of [['/api/session', 200], ['/api/library', 200], ['/api/books/MISSING', 404]]) {
+    // Make the real session eligible for Better Auth's daily refresh without waiting.
+    await pool.query('UPDATE "session" SET "expiresAt"=$1 WHERE "userId"=$2', [new Date(Date.now() + 29 * 86_400_000 - 5000), user.session.user.id]);
+    const result = await call(path, { cookie: user.cookie });
+    assert.equal(result.status, status);
+    const renewed = result.response.headers.getSetCookie().find((value) => value.includes('session_token='));
+    assert.ok(renewed, `${path} should deliver the renewed cookie to the browser`);
+    assert.match(renewed, /; Max-Age=2592000(?:;|$)/i);
+    assert.match(renewed, /; Secure/i); assert.match(renewed, /; HttpOnly/i); assert.match(renewed, /; SameSite=Lax/i);
+    assert.equal(result.response.headers.get('cache-control'), 'private, no-store');
+    const stored = (await pool.query('SELECT "expiresAt" FROM "session" WHERE "userId"=$1', [user.session.user.id])).rows[0];
+    assert.ok(new Date(stored.expiresAt).getTime() > Date.now() + 29.9 * 86_400_000);
+  }
+  const current = await call('/api/session', { cookie: user.cookie });
+  assert.equal(current.status, 200);
+  assert.ok(!current.response.headers.getSetCookie().some((value) => value.includes('session_token=')));
+});
+
+test('expired sessions clear the browser cookie while keeping the library private', async () => {
+  const user = await login();
+  await pool.query('UPDATE "session" SET "expiresAt"=$1 WHERE "userId"=$2', [new Date(Date.now() - 1000), user.session.user.id]);
+  const result = await call('/api/library', { cookie: user.cookie });
+  assert.equal(result.status, 401);
+  const cleared = result.response.headers.getSetCookie().find((value) => value.includes('session_token='));
+  assert.ok(cleared, 'The browser should receive the expired session cookie');
+  assert.match(cleared, /; Max-Age=0(?:;|$)/i);
+  assert.equal(result.response.headers.get('cache-control'), 'private, no-store');
+  assert.equal(result.body.books, undefined);
 });
 
 test('pairing binds the approving owner, expires, cannot replay, and credentials are hashed', async () => {

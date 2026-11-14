@@ -3,6 +3,7 @@
 import argparse
 import fcntl
 import getpass
+import hashlib
 import json
 import math
 import os
@@ -20,7 +21,9 @@ from urllib.parse import urlsplit
 from library import BooksLibrary
 
 
-CONFIG = Path(__file__).resolve().parent / ".local/companion.json"
+RUNTIME = Path.home() / "Library/Application Support/Apple Books Companion"
+CONFIG = RUNTIME / ".local/companion.json"
+LEGACY_CONFIG = Path(__file__).resolve().parent / ".local/companion.json"
 MAX_BODY = 1024 * 1024
 MAX_BOOKS = 200
 MAX_SEQUENCE = 9007199254740991
@@ -152,6 +155,19 @@ def config_lock(path=CONFIG):
         os.close(descriptor)
 
 
+def migrate_legacy_config(source=LEGACY_CONFIG, target=CONFIG):
+    """Keep one pairing when upgrading from a checkout-local installation."""
+    source, target = Path(source), Path(target)
+    if source == target or not source.exists():
+        return
+    with config_lock(target):
+        if target.exists():
+            return  # Never replace an existing installation's identity.
+        config = read_config(source)
+        write_config(config, target)
+        source.unlink()
+
+
 def metadata_book(detail):
     """An explicit allowlist: source paths, URLs, files, and web credentials never leave the Mac."""
     def string(value, field, default=None):
@@ -231,20 +247,23 @@ def pair(server, name, allow_local_http=False, path=CONFIG):
     config = {"server": server, "deviceId": device["id"], "name": name.strip(),
               "credential": credential, "sequence": 0, "allowLocalHttp": allow_local_http}
     write_config(config, path)
-    print("Mac paired. Device credential saved in .local/companion.json with permissions 0600 (not Keychain).")
+    print(f"Mac paired. Device credential saved in {path} with permissions 0600 (not Keychain).")
 
 
-def sync(path=CONFIG, library=None, client=None):
+def sync(path=CONFIG, library=None, client=None, *, skip_unchanged=False, quiet=False):
     with config_lock(path):
-        _sync(path, library, client)
+        return _sync(path, library, client, skip_unchanged=skip_unchanged, quiet=quiet)
 
 
-def _sync(path, library=None, client=None):
+def _sync(path, library=None, client=None, *, skip_unchanged=False, quiet=False):
     config = read_config(path)
     client = client or SyncClient(config["server"], config["credential"], config.get("allowLocalHttp") is True)
     library = library or BooksLibrary()
     books = [metadata_book(library.book(book["id"])) for book in library.list_books()["books"]]
     batches = snapshot_batches(books)
+    snapshot_hash = hashlib.sha256(encode(books)).hexdigest()
+    if skip_unchanged and config.get("snapshotHash") == snapshot_hash:
+        return {"changed": False, "books": len(books)}
     for batch in batches:
         # Reserve before sending, so a crash cannot reuse an acknowledged sequence.
         config["sequence"] = max(config["sequence"] + 1, time.time_ns() // 1_000_000)
@@ -262,8 +281,12 @@ def _sync(path, library=None, client=None):
     positions = result.get("positions", [])
     if not isinstance(positions, list):
         raise CompanionError("The sync service returned invalid pending positions.")
-    print(f"Sent metadata for {len(books)} books in {len(batches)} batches. {len(positions)} web positions awaiting Apple Books handoff.")
-    print("EPUBs stayed on this Mac. Apple Books was not modified.")
+    config["snapshotHash"] = snapshot_hash
+    write_config(config, path)
+    if not quiet:
+        print(f"Sent metadata for {len(books)} books in {len(batches)} batches. {len(positions)} web positions awaiting Apple Books handoff.")
+        print("EPUBs stayed on this Mac. Apple Books was not modified.")
+    return {"changed": True, "books": len(books)}
 
 
 def main():
@@ -275,11 +298,14 @@ def main():
     pairing.add_argument("--allow-local-http", action="store_true", help="Development only: permit http://127.0.0.1")
     commands.add_parser("sync", help="Send one metadata snapshot; does not change Apple Books")
     sharing = commands.add_parser("serve", help="Offer selected EPUBs directly to your devices on the same Wi-Fi")
-    sharing.add_argument("--minutes", type=int, default=30, help="How long to offer transfers (1–480; default 30 minutes)")
+    duration = sharing.add_mutually_exclusive_group()
+    duration.add_argument("--minutes", type=int, default=30, help="How long to offer transfers (1–480; default 30 minutes)")
+    duration.add_argument("--background", action="store_true", help="Run continuously for the macOS background service")
     commands.add_parser("status", help="Show pairing details without credentials")
     commands.add_parser("unpair", help="Remove the local credential; revoke the device separately on the website")
     arguments = parser.parse_args()
     try:
+        migrate_legacy_config()
         if arguments.command == "pair":
             with config_lock():
                 pair(arguments.server, arguments.name, arguments.allow_local_http)
@@ -293,7 +319,7 @@ def main():
                 from transfer import serve_transfers
             except ImportError:
                 raise CompanionError("Run ./scripts/start-transfers.sh to install the direct-transfer dependencies.") from None
-            asyncio.run(serve_transfers(minutes=arguments.minutes))
+            asyncio.run(serve_transfers(minutes=arguments.minutes, background=arguments.background))
         elif arguments.command == "status":
             config = read_config()
             print(f"Paired: {config.get('name', 'Mac companion')}\nServer: {config['server']}\nDevice: {config['deviceId']}\nLast reserved sequence: {config['sequence']}")
@@ -312,4 +338,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # transfer imports the same helpers; retain a single exception/config module
+    # when this file was invoked as a script rather than imported.
+    sys.modules["companion"] = sys.modules[__name__]
     raise SystemExit(main())

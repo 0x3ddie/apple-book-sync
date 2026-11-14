@@ -5,12 +5,16 @@ No HTTP file server, public file link, TURN relay, or incoming file writes exist
 """
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
 import re
+import stat
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 
@@ -23,6 +27,26 @@ MAX_EPUB_BYTES = 128 * 1024 * 1024
 CHUNK_BYTES = 16 * 1024
 HIGH_WATER = 256 * 1024
 POLL_SECONDS = 5
+IDLE_POLL_SECONDS = 20
+
+
+@contextmanager
+def service_lock(path):
+    """Only one sender may consume this Mac's offers, across terminal/login runs."""
+    descriptor = os.open(Path(path).with_name("transfer-service.lock"),
+                         os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise CompanionError("The transfer lock must be an owned regular file.")
+        os.fchmod(descriptor, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise CompanionError("The Mac companion is already offering transfers. Use Save offline on your phone.") from None
+        yield
+    finally:
+        os.close(descriptor)
 
 
 class TransferFailure(Exception):
@@ -172,26 +196,43 @@ async def serve_offer(offer, library, client, *, timeout=170):
         await peer.close()
 
 
-async def serve_transfers(*, minutes=30, path=CONFIG):
+async def serve_transfers(*, minutes=30, path=CONFIG, background=False):
+    if background and not Path(path).exists():
+        print("This Mac is not paired. Background transfers stopped.", flush=True)
+        return
+    # Validate pairing before creating the sibling lock file.
+    read_config(path)
+    with service_lock(path):
+        await _serve_transfers(minutes=minutes, path=path, background=background)
+
+
+async def _serve_transfers(*, minutes, path, background):
     config = read_config(path)
     client = SyncClient(config["server"], config["credential"], config.get("allowLocalHttp") is True)
     library = BooksLibrary()
-    await asyncio.to_thread(sync, path, library)
-    deadline = time.monotonic() + minutes * 60
+    deadline = float("inf") if background else time.monotonic() + minutes * 60
     tasks = {}
     seen = {}
-    next_sync = time.monotonic() + 60
+    next_sync = 0
     connected = False
+    connection_warning = False
     try:
         while time.monotonic() < deadline:
+            if not Path(path).exists():
+                print("Local Mac pairing was removed. Background transfers stopped.", flush=True)
+                return
             try:
                 batch = await asyncio.to_thread(client.request, "GET", "/api/companion/transfers")
                 if not isinstance(batch.get("transfers"), list):
                     raise CompanionError("Invalid transfer response. Update the Mac companion.")
                 if not connected:
-                    print(f"Ready for direct transfers for {minutes} minutes. Keep your phone on the same Wi-Fi and choose Save offline.", flush=True)
-                    print("Press Control-C to stop. EPUB files go directly to your device, never through Vercel.", flush=True)
+                    if background:
+                        print("Background companion connected. Ready for direct transfers on the same Wi-Fi.", flush=True)
+                    else:
+                        print(f"Ready for direct transfers for {minutes} minutes. Keep your phone on the same Wi-Fi and choose Save offline.", flush=True)
+                        print("Press Control-C to stop. EPUB files go directly to your device, never through Vercel.", flush=True)
                 connected = True
+                connection_warning = False
                 now = time.monotonic()
                 seen = {key: expiry for key, expiry in seen.items() if expiry > now}
                 for item in batch["transfers"][:3]:
@@ -210,15 +251,23 @@ async def serve_transfers(*, minutes=30, path=CONFIG):
                             print("Skipped an invalid or expired transfer request.", flush=True)
                         del tasks[key]
                 if now >= next_sync:
-                    await asyncio.to_thread(sync, path, library)
-                    next_sync = now + 60
+                    result = await asyncio.to_thread(sync, path, library, client,
+                                                     skip_unchanged=background, quiet=background)
+                    if background and result["changed"]:
+                        print(f"Updated library metadata for {result['books']} books.", flush=True)
+                    next_sync = time.monotonic() + 60
             except CompanionError as error:
                 if error.status in (401, 403):
+                    if background:
+                        print("This Mac was unlinked. Background transfers stopped; pair and install again to reconnect.", flush=True)
+                        return  # A clean exit prevents launchd restarting a revoked credential.
                     raise  # Stop all transfers as soon as the Mac is unlinked.
-                if connected:
-                    print("Sync connection interrupted; retrying while this transfer window is open.", flush=True)
+                if not connection_warning:
+                    print("Sync connection interrupted; the companion will retry automatically.", flush=True)
+                connection_warning = True
                 connected = False
-            await asyncio.sleep(min(POLL_SECONDS, max(0, deadline - time.monotonic())))
+            interval = IDLE_POLL_SECONDS if background and not tasks else POLL_SECONDS
+            await asyncio.sleep(min(interval, max(0, deadline - time.monotonic())))
     finally:
         for task in tasks.values():
             task.cancel()
