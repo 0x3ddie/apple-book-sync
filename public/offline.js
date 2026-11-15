@@ -88,6 +88,41 @@ const OfflineBooks = window.OfflineBooks = (() => {
     remove: (id) => transaction("books", "readwrite", (store) => store.delete(id)),
     saveLibrary: (books) => transaction("library", "readwrite", (store) => store.put(books, "catalogue")),
     readLibrary: () => transaction("library", "readonly", (store) => store.get("catalogue")),
+    listCovers: async () => await transaction("library", "readonly", (store) => store.get("covers")) || [],
+    async putCovers(records, expectedScope) {
+      if (!Array.isArray(records) || records.some((record) => !record || typeof record.id !== "string" || !/^[A-Za-z0-9._:-]{1,200}$/.test(record.id)
+        || record.cover !== null && !(record.cover instanceof Blob) || typeof record.checkedAt !== "string" || !Number.isFinite(Date.parse(record.checkedAt))
+        || record.availableOnMac !== undefined && typeof record.availableOnMac !== "boolean")) {
+        throw new Error("Invalid cover records.");
+      }
+      const operationScope = scope;
+      const changed = () => !operationScope || scope !== operationScope || expectedScope && expectedScope !== operationScope;
+      const accountError = () => new Error("Your account changed. Reopen your library before saving covers.");
+      if (changed()) throw accountError();
+      const db = await open();
+      if (changed()) throw accountError();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction("library", "readwrite"), store = tx.objectStore("library");
+        const request = store.get("covers");
+        let merged, failure;
+        request.onsuccess = () => {
+          if (changed()) { failure = accountError(); tx.abort(); return; }
+          const covers = new Map((request.result || []).map((record) => [record.id, record]));
+          for (const record of records) {
+            // An absent Mac image must not erase a cover extracted concurrently
+            // from the already-saved EPUB in another task or tab.
+            if (record.cover === null && covers.get(record.id)?.cover) continue;
+            covers.set(record.id, { id: record.id, cover: record.cover, checkedAt: record.checkedAt,
+              ...(record.availableOnMac !== undefined ? { availableOnMac: record.availableOnMac } : {}) });
+          }
+          merged = [...covers.values()];
+          store.put(merged, "covers");
+        };
+        tx.oncomplete = () => changed() ? reject(accountError()) : resolve(merged);
+        tx.onerror = () => reject(tx.error || request.error);
+        tx.onabort = () => reject(failure || tx.error || new Error("Cover storage was interrupted."));
+      });
+    },
     async updateDetail(detail) {
       const db = await open();
       return new Promise((resolve, reject) => {

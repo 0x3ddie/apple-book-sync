@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS books_devices (
 CREATE INDEX IF NOT EXISTS books_devices_owner ON books_devices(owner_id);
 CREATE UNIQUE INDEX IF NOT EXISTS books_devices_active_owner ON books_devices(owner_id) WHERE revoked_at IS NULL;
 ALTER TABLE books_devices ADD COLUMN IF NOT EXISTS transfer_seen_at timestamptz;
+ALTER TABLE books_devices ADD COLUMN IF NOT EXISTS covers_supported boolean NOT NULL DEFAULT false;
 
 -- The short code locates a pending Mac. Only its private secret can complete pairing.
 CREATE TABLE IF NOT EXISTS books_device_pairings (
@@ -67,3 +68,5 @@ CREATE TABLE IF NOT EXISTS books_transfers (
 );
 CREATE INDEX IF NOT EXISTS books_transfers_expiry ON books_transfers(expires_at);
 CREATE INDEX IF NOT EXISTS books_transfers_device ON books_transfers(owner_id, device_id);
+ALTER TABLE books_transfers ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'epub';
+ALTER TABLE books_transfers ADD COLUMN IF NOT EXISTS book_ids jsonb;

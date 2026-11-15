@@ -458,8 +458,12 @@ const connection = (type = 'offer', extraLines = []) => ({ type, sdp: [
   'a=candidate:1234 1 udp 2122260223 12345678-abcd.local 54000 typ host generation 0 network-cost 10',
   'a=end-of-candidates', ...extraLines, '',
 ].join('\r\n') });
-const receiveTransfers = (credential) => call('/api/companion/transfers', { bearer: credential, originHeader: null });
+const receiveTransfers = (credential, covers = false) => call('/api/companion/transfers', {
+  bearer: credential, originHeader: null, ...(covers ? { headers: { 'X-Books-Covers': '1' } } : {}),
+});
 const startTransfer = (cookie, body = { bookId: 'BOOK1', offer: connection() }, options = {}) => call('/api/transfers', { cookie, body, ...options });
+const startCovers = (cookie, bookIds = ['BOOK1'], options = {}) => startTransfer(cookie,
+  { kind: 'covers', bookId: bookIds[0], bookIds, offer: connection() }, options);
 const answerTransfer = (credential, id, body = { answer: connection('answer') }) => call(`/api/companion/transfers/${id}`, { bearer: credential, originHeader: null, body });
 
 async function transferFixture() {
@@ -564,4 +568,139 @@ test('transfer APIs reject files, free-form SDP, media tracks, wrong origins, an
   assert.equal((await answerTransfer(mac.credential, id, { error: 'BOOK_TOO_LARGE' })).status, 200);
   const failed = (await call(`/api/transfers/${id}`, { cookie: alice.cookie })).body;
   assert.equal(failed.status, 'failed'); assert.equal(failed.error, 'BOOK_TOO_LARGE'); assert.equal(failed.answer, null);
+});
+
+test('cover batches use capable companions and never reach an older EPUB-only sender', async () => {
+  const { alice, mac } = await transferFixture();
+  await push(mac.credential, [book(), book({ id: 'CLOUD_ONLY', availableOnMac: false })], 2);
+  assert.equal((await call('/api/library', { cookie: alice.cookie })).body.coversReady, false);
+  const unsupported = await startCovers(alice.cookie);
+  assert.equal(unsupported.status, 409); assert.match(unsupported.body.error, /Update and restart/);
+  const epub = await startTransfer(alice.cookie);
+  assert.equal(epub.status, 200);
+  assert.equal((await startTransfer(alice.cookie, { bookId: 'CLOUD_ONLY', offer: connection() })).status, 409);
+  await receiveTransfers(mac.credential, true);
+  assert.equal((await call('/api/library', { cookie: alice.cookie })).body.coversReady, true);
+  const covers = await startCovers(alice.cookie, ['CLOUD_ONLY', 'BOOK1']);
+  assert.equal(covers.status, 200, JSON.stringify(covers.body));
+  const pending = (await receiveTransfers(mac.credential, true)).body.transfers;
+  const coverOffer = pending.find((item) => item.id === covers.body.id);
+  assert.deepEqual(coverOffer, { id: covers.body.id, bookId: 'CLOUD_ONLY', kind: 'covers',
+    bookIds: ['CLOUD_ONLY', 'BOOK1'], offer: connection(), expiresAt: covers.body.expiresAt });
+  const epubOffer = pending.find((item) => item.id === epub.body.id);
+  assert.equal(epubOffer.kind, undefined); assert.equal(epubOffer.bookIds, undefined);
+  assert.equal((await call(`/api/transfers/${epub.body.id}`, { cookie: alice.cookie })).body.kind, undefined);
+  const progress = (await call(`/api/transfers/${covers.body.id}`, { cookie: alice.cookie })).body;
+  assert.equal(progress.kind, 'covers'); assert.equal(progress.bookIds, undefined); assert.equal(progress.offer, undefined);
+  const oldPending = (await receiveTransfers(mac.credential)).body.transfers;
+  assert.deepEqual(oldPending.map((item) => item.id), [epub.body.id]);
+  assert.equal((await call('/api/library', { cookie: alice.cookie })).body.coversReady, false);
+  assert.equal((await startCovers(alice.cookie)).status, 409);
+  for (const flag of ['true', '01']) {
+    await call('/api/companion/transfers', { bearer: mac.credential, originHeader: null, headers: { 'X-Books-Covers': flag } });
+    assert.equal((await call('/api/library', { cookie: alice.cookie })).body.coversReady, false);
+  }
+  await receiveTransfers(mac.credential, true);
+  assert.equal((await answerTransfer(mac.credential, covers.body.id)).status, 200);
+  const answered = await call(`/api/transfers/${covers.body.id}`, { cookie: alice.cookie });
+  assert.equal(answered.body.kind, 'covers'); assert.equal(answered.body.status, 'answered');
+  assert.deepEqual(answered.body.answer, connection('answer'));
+  const stored = (await pool.query('SELECT kind,book_ids,offer,answer FROM books_transfers WHERE id=$1', [covers.body.id])).rows[0];
+  assert.deepEqual(stored, { kind: 'covers', book_ids: ['CLOUD_ONLY', 'BOOK1'], offer: connection(), answer: connection('answer') });
+});
+
+test('legacy transfer inserts default to EPUB and schema upgrades preserve existing offers', async () => {
+  const { alice, mac } = await transferFixture();
+  const expiresAt = new Date(time + 180_000);
+  await pool.query(`INSERT INTO books_transfers (id,owner_id,book_id,device_id,offer,created_at,expires_at)
+    VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7)`, ['legacy-offer', alice.session.user.id, 'BOOK1', mac.device.id,
+    JSON.stringify(connection()), new Date(time), expiresAt]);
+  await database.exec(await readFile(new URL('../schema.sql', import.meta.url), 'utf8'));
+  const stored = (await pool.query('SELECT kind,book_ids FROM books_transfers WHERE id=$1', ['legacy-offer'])).rows[0];
+  assert.deepEqual(stored, { kind: 'epub', book_ids: null });
+  assert.deepEqual((await receiveTransfers(mac.credential)).body.transfers,
+    [{ id: 'legacy-offer', bookId: 'BOOK1', offer: connection(), expiresAt: expiresAt.toISOString() }]);
+});
+
+test('every cover ID must belong to the reader and the same active source Mac', async () => {
+  const alice = await login(), oldMac = await pair(alice.cookie);
+  await push(oldMac.credential, [book({ id: 'OLD_MAC' })]);
+  const mac = await pair(alice.cookie);
+  await push(mac.credential, [book()]); await receiveTransfers(mac.credential, true);
+  const catalogue = (await call('/api/library', { cookie: alice.cookie })).body;
+  assert.equal(catalogue.coversReady, true);
+  assert.equal(catalogue.coverDeviceId, mac.device.id);
+  assert.equal(catalogue.books.find((item) => item.id === 'OLD_MAC').sourceDeviceId, oldMac.device.id);
+  assert.deepEqual(catalogue.books.filter((item) => item.sourceDeviceId === catalogue.coverDeviceId).map((item) => item.id), ['BOOK1']);
+  const bob = await login('bob@example.test'), otherMac = await pair(bob.cookie);
+  await push(otherMac.credential, [book({ id: 'BOB_PRIVATE' })]); await receiveTransfers(otherMac.credential, true);
+  assert.equal((await startCovers(alice.cookie, ['BOOK1', 'BOB_PRIVATE'])).status, 404);
+  assert.equal((await startCovers(alice.cookie, ['BOOK1', 'MISSING'])).status, 404);
+  assert.equal((await startCovers(alice.cookie, ['BOOK1', 'OLD_MAC'])).status, 409);
+  assert.equal((await startCovers(alice.cookie, ['OLD_MAC'])).status, 503);
+  assert.equal((await startCovers(alice.cookie, ['BOOK1'], { accountHeader: bob.session.user.id })).status, 401);
+  assert.equal((await startCovers(alice.cookie, ['BOOK1'], { originHeader: null })).status, 403);
+  const created = await startCovers(alice.cookie);
+  assert.equal(created.status, 200);
+  assert.deepEqual((await receiveTransfers(otherMac.credential, true)).body.transfers, []);
+  assert.equal((await call(`/api/transfers/${created.body.id}`, { cookie: bob.cookie })).status, 404);
+  assert.equal((await answerTransfer(otherMac.credential, created.body.id)).status, 404);
+});
+
+test('cover batches reject malformed lists, unknown kinds, image bytes, and unsafe descriptions', async () => {
+  const { alice, mac } = await transferFixture();
+  await receiveTransfers(mac.credential, true);
+  const value = { kind: 'covers', bookId: 'BOOK1', bookIds: ['BOOK1'], offer: connection() };
+  const malformed = [
+    { ...value, kind: 'images' }, { ...value, kind: null }, { ...value, bookIds: null },
+    { ...value, bookIds: [] }, { ...value, bookIds: ['BOOK1', 'BOOK1'] },
+    { ...value, bookIds: ['OTHER', 'BOOK1'] }, { ...value, bookIds: ['BOOK1', 2] },
+    { ...value, bookIds: ['BOOK1', '../private.jpg'] },
+    { ...value, bookIds: Array.from({ length: 201 }, (_, index) => index ? `BOOK${index + 1}` : 'BOOK1') },
+    { ...value, kind: 'epub' }, { bookId: 'BOOK1', bookIds: ['BOOK1'], offer: connection() },
+    { ...value, covers: ['data:image/jpeg;base64,private-image'] }, { ...value, imageBytes: 'private-image' },
+    { ...value, offer: connection('offer', ['a=x-cover:data:image/jpeg;base64,private-image']) },
+  ];
+  for (const body of malformed) assert.equal((await startTransfer(alice.cookie, body)).status, 400);
+  const created = await startCovers(alice.cookie);
+  assert.equal(created.status, 200);
+  assert.equal((await answerTransfer(mac.credential, created.body.id, { answer: connection('answer'), cover: 'private-image' })).status, 400);
+  assert.equal((await call('/api/books/BOOK1/cover', { cookie: alice.cookie })).status, 404);
+  assert.ok(!JSON.stringify((await pool.query('SELECT * FROM books_transfers')).rows).includes('private-image'));
+});
+
+test('a cover batch accepts 200 bounded IDs including the largest valid identifiers', async () => {
+  const { alice, mac } = await transferFixture();
+  const ids = Array.from({ length: 200 }, (_, index) => `BOOK${index}`.padEnd(200, 'x'));
+  await push(mac.credential, ids.map((id) => book({ id, availableOnMac: false })), 2);
+  await receiveTransfers(mac.credential, true);
+  const created = await startCovers(alice.cookie, ids);
+  assert.equal(created.status, 200, JSON.stringify(created.body));
+  assert.deepEqual((await receiveTransfers(mac.credential, true)).body.transfers[0].bookIds, ids);
+});
+
+test('cover offers share transfer quotas and become unavailable after expiry or revocation', async () => {
+  const { alice, mac } = await transferFixture();
+  await receiveTransfers(mac.credential, true);
+  const created = await Promise.all([startCovers(alice.cookie), startTransfer(alice.cookie), startCovers(alice.cookie)]);
+  assert.ok(created.every((result) => result.status === 200));
+  assert.equal((await startCovers(alice.cookie)).status, 429);
+  time += 30_001;
+  const staleLibrary = (await call('/api/library', { cookie: alice.cookie })).body;
+  assert.equal(staleLibrary.coversReady, false);
+  assert.equal(staleLibrary.coverDeviceId, null);
+  assert.equal((await startCovers(alice.cookie)).status, 503);
+  time += 150_000;
+  for (const result of created) {
+    assert.equal((await call(`/api/transfers/${result.body.id}`, { cookie: alice.cookie })).status, 404);
+    assert.equal((await answerTransfer(mac.credential, result.body.id)).status, 404);
+  }
+  assert.deepEqual((await receiveTransfers(mac.credential, true)).body.transfers, []);
+  const active = await startCovers(alice.cookie);
+  assert.equal(active.status, 200);
+  await call(`/api/devices/${mac.device.id}/revoke`, { cookie: alice.cookie, body: {} });
+  assert.equal((await call(`/api/transfers/${active.body.id}`, { cookie: alice.cookie })).status, 404);
+  assert.equal((await receiveTransfers(mac.credential, true)).status, 401);
+  assert.equal((await startCovers(alice.cookie)).status, 503);
+  assert.equal((await call('/api/library', { cookie: alice.cookie })).body.coversReady, false);
 });

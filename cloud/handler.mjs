@@ -73,7 +73,9 @@ export function createHandler({ store, auth, origin }) {
           return reply(200, await store.importSnapshot(device, snapshot(await jsonBody(request, 1_048_576))));
         }
         if (path === '/api/companion/positions' && method === 'GET') return reply(200, await store.positions(device));
-        if (path === '/api/companion/transfers' && method === 'GET') return reply(200, await store.pendingTransfers(device));
+        if (path === '/api/companion/transfers' && method === 'GET') {
+          return reply(200, await store.pendingTransfers(device, request.headers.get('x-books-covers') === '1'));
+        }
         const answerMatch = path.match(/^\/api\/companion\/transfers\/([^/]+)$/);
         if (answerMatch && method === 'POST') return reply(200, await store.answerTransfer(device,
           identifier(decodeURIComponent(answerMatch[1]), 'transfer identifier'), transferAnswer(await jsonBody(request, 40_960))));
@@ -99,7 +101,7 @@ export function createHandler({ store, auth, origin }) {
         const code = string(body.code, 6, 'six-digit pairing code', { pattern: /^\d{6}$/ });
         return reply(200, await store.claimPairing(owner, code, clientIP));
       }
-      if (path === '/api/transfers' && method === 'POST') return reply(200, await store.createTransfer(owner, transferRequest(await jsonBody(request, 40_960))));
+      if (path === '/api/transfers' && method === 'POST') return reply(200, await store.createTransfer(owner, transferRequest(await jsonBody(request, 81_920))));
       const transferMatch = path.match(/^\/api\/transfers\/([^/]+)(?:\/(close))?$/);
       if (transferMatch) {
         const id = identifier(decodeURIComponent(transferMatch[1]), 'transfer identifier');

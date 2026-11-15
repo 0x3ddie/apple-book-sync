@@ -51,8 +51,21 @@ export function transferDescription(value, type) {
 }
 
 export function transferRequest(value) {
-  fields(value, ['bookId', 'offer'], 'transfer');
-  return { bookId: identifier(value.bookId), offer: transferDescription(value.offer, 'offer') };
+  fields(value, ['kind', 'bookId', 'bookIds', 'offer'], 'transfer');
+  if (value.kind !== undefined && !['epub', 'covers'].includes(value.kind)) throw new HttpError(400, 'Invalid transfer kind.');
+  const bookId = identifier(value.bookId);
+  if (value.kind === 'covers') {
+    if (!Array.isArray(value.bookIds) || !value.bookIds.length || value.bookIds.length > 200) {
+      throw new HttpError(400, 'Choose between 1 and 200 books for cover sync.');
+    }
+    const bookIds = value.bookIds.map((id) => identifier(id));
+    if (bookIds[0] !== bookId || new Set(bookIds).size !== bookIds.length) {
+      throw new HttpError(400, 'Cover sync needs unique books with the first book as its anchor.');
+    }
+    return { kind: 'covers', bookId, bookIds, offer: transferDescription(value.offer, 'offer') };
+  }
+  if (Object.hasOwn(value, 'bookIds')) throw new HttpError(400, 'EPUB transfers accept one book only.');
+  return { bookId, offer: transferDescription(value.offer, 'offer') };
 }
 
 export function transferAnswer(value) {

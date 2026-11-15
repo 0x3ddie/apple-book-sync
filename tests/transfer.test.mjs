@@ -10,7 +10,7 @@ const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 1, 2, 3, 4]);
 const hash = async (data) => Buffer.from(await webcrypto.subtle.digest('SHA-256', data)).toString('hex');
 const header = async (overrides = {}) => ({ type: 'book', bookId, size: bytes.length, sha256: await hash(bytes), ...overrides });
 
-function setup({ messages, save, gather = true } = {}) {
+function setup({ messages, save, gather = true, kind = 'epub', bookIds, expectedBytes = bytes, sessionKind } = {}) {
   const requests = [], receipts = [];
   let peer, stored = false;
   class Channel extends EventTarget {
@@ -21,7 +21,7 @@ function setup({ messages, save, gather = true } = {}) {
   class Peer extends EventTarget {
     iceGatheringState = gather ? 'complete' : 'gathering'; connectionState = 'new';
     constructor(config) { super(); assert.deepEqual(JSON.parse(JSON.stringify(config)), { iceServers: [] }); peer = this; }
-    createDataChannel(label, options) { assert.equal(label, 'books-epub-v1'); assert.equal(options.ordered, true); return this.channel = new Channel(); }
+    createDataChannel(label, options) { assert.equal(label, kind === 'covers' ? 'books-covers-v1' : 'books-epub-v1'); assert.equal(options.ordered, true); return this.channel = new Channel(); }
     async createOffer() { return { type: 'offer', sdp: 'data-channel-offer' }; }
     async setLocalDescription(value) { this.localDescription = value; }
     async setRemoteDescription(value) {
@@ -43,16 +43,16 @@ function setup({ messages, save, gather = true } = {}) {
   vm.runInNewContext(source, context);
   const controller = new AbortController();
   const receive = context.window.BookTransfer.receive({
-    bookId, signal: controller.signal,
+    bookId, kind, bookIds, signal: controller.signal,
     request: async (path, options = {}) => {
       requests.push({ path, options });
       if (path === '/api/transfers') return { id: 'transfer-1', expiresAt: new Date(Date.now() + 180000).toISOString() };
       if (path.endsWith('/close')) return { ok: true };
-      return { id: 'transfer-1', bookId, status: 'answered', answer: { type: 'answer', sdp: 'data-channel-answer' } };
+      return { id: 'transfer-1', bookId, kind: sessionKind ?? (kind === 'covers' ? 'covers' : undefined), status: 'answered', answer: { type: 'answer', sdp: 'data-channel-answer' } };
     },
     save: async (blob) => {
-      assert.equal(blob.type, 'application/epub+zip');
-      assert.deepEqual(new Uint8Array(await blob.arrayBuffer()), bytes);
+      assert.equal(blob.type, kind === 'covers' ? 'application/json' : 'application/epub+zip');
+      assert.deepEqual(new Uint8Array(await blob.arrayBuffer()), expectedBytes);
       if (save) await save(blob);
       stored = true;
       return { id: bookId, epub: blob };
@@ -158,3 +158,37 @@ test('account change while IndexedDB opens rejects a stale transfer write', asyn
   assert.equal(closed, true);
   await assert.rejects(storage.put({ id: bookId }, 'account:first'), /account changed/);
 });
+
+test('cover channel verifies its JSON bundle and waits for durable storage before receipt', async () => {
+  const coverBytes = new TextEncoder().encode(JSON.stringify({ version: 1, covers: [{ id: bookId, mime: null, data: null }] }));
+  let started, release;
+  const saving = new Promise((resolve) => { started = resolve; });
+  const persist = new Promise((resolve) => { release = resolve; });
+  const flow = setup({
+    kind: 'covers', bookIds: [bookId], expectedBytes: coverBytes,
+    messages: async () => [{ type: 'covers', bookId, size: coverBytes.length, sha256: await hash(coverBytes) }, coverBytes.buffer, { type: 'end' }],
+    save: async () => { started(); await persist; },
+  });
+  await saving;
+  assert.equal(flow.receipts.length, 0);
+  release();
+  await flow.receive;
+  assert.deepEqual(flow.receipts, [{ value: { type: 'received' }, stored: true }]);
+  assert.deepEqual(JSON.parse(JSON.stringify(flow.requests[0].options.body)), {
+    kind: 'covers', bookId, bookIds: [bookId], offer: { type: 'offer', sdp: 'data-channel-offer' },
+  });
+});
+
+for (const [name, options, pattern] of [
+  ['different signaling kind', { sessionKind: 'epub' }, /does not match/],
+  ['EPUB header on the cover channel', { messages: async () => [await header()] }, /out of order/],
+  ['oversized cover bundle', { messages: async () => [await header({ type: 'covers', size: 16 * 1024 * 1024 + 1 })] }, /unsupported/],
+  ['cover hash mismatch', { messages: async () => [await header({ type: 'covers', sha256: '0'.repeat(64) }), bytes.buffer, { type: 'end' }] }, /integrity check/],
+]) {
+  test(`rejects ${name} without acknowledgment`, async () => {
+    const flow = setup({ kind: 'covers', bookIds: [bookId], save: () => assert.fail('Invalid covers must not be saved'), ...options });
+    await assert.rejects(flow.receive, pattern);
+    assert.equal(flow.receipts.length, 0);
+    assert.ok(flow.requests.some((item) => item.path.endsWith('/close')));
+  });
+}

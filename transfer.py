@@ -1,4 +1,4 @@
-"""Send selected EPUBs over encrypted, direct WebRTC data channels.
+"""Send selected EPUBs and thumbnails over encrypted, direct WebRTC channels.
 
 The cloud client carries only authenticated connection setup, never file bytes.
 No HTTP file server, public file link, TURN relay, or incoming file writes exist.
@@ -7,6 +7,7 @@ No HTTP file server, public file link, TURN relay, or incoming file writes exist
 import asyncio
 import fcntl
 import hashlib
+import io
 import json
 import os
 import re
@@ -19,10 +20,12 @@ from pathlib import Path
 from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 
 from companion import CONFIG, CompanionError, SyncClient, read_config, sync
+from covers import cover_bundle
 from library import BooksLibrary
 
 
 CHANNEL = "books-epub-v1"
+COVERS_CHANNEL = "books-covers-v1"
 MAX_EPUB_BYTES = 128 * 1024 * 1024
 CHUNK_BYTES = 16 * 1024
 HIGH_WATER = 256 * 1024
@@ -63,9 +66,9 @@ def file_digest(source):
     return digest.hexdigest()
 
 
-async def transmit(channel, source, book_id, size, digest, acknowledged, closed, mark_ended):
+async def transmit(channel, source, book_id, size, digest, acknowledged, closed, mark_ended, *, kind="book"):
     """Backpressure bounds memory; a phone ACK means it finished its durable save."""
-    channel.send(json.dumps({"type": "book", "bookId": book_id, "size": size, "sha256": digest}))
+    channel.send(json.dumps({"type": kind, "bookId": book_id, "size": size, "sha256": digest}))
     while chunk := source.read(CHUNK_BYTES):
         while channel.bufferedAmount > HIGH_WATER:
             if closed.is_set() or channel.readyState != "open":
@@ -91,15 +94,32 @@ async def transmit(channel, source, book_id, size, digest, acknowledged, closed,
 
 
 async def serve_offer(offer, library, client, *, timeout=170):
-    """One authorized book per offer; the remote peer never supplies file paths."""
+    """Authorized book IDs only; the remote peer never supplies file paths."""
+    if not isinstance(offer, dict):
+        raise TransferFailure("TRANSFER_FAILED")
     transfer_id = offer.get("id", "")
     book_id = offer.get("bookId", "")
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", transfer_id) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", book_id):
+    if (not isinstance(transfer_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", transfer_id)
+            or not isinstance(book_id, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", book_id)):
         raise TransferFailure("TRANSFER_FAILED")
+    kind = offer.get("kind", "epub")
+    if kind not in ("epub", "covers"):
+        raise TransferFailure("TRANSFER_FAILED")
+    book_ids = offer.get("bookIds")
+    if kind == "covers":
+        if (not isinstance(book_ids, list) or not 1 <= len(book_ids) <= 200
+                or any(not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", value)
+                       for value in book_ids)
+                or len(set(book_ids)) != len(book_ids) or book_ids[0] != book_id):
+            raise TransferFailure("TRANSFER_FAILED")
     description = offer.get("offer", {})
-    if description.get("type") != "offer" or not isinstance(description.get("sdp"), str) or len(description["sdp"]) > 32768:
+    if (not isinstance(description, dict) or description.get("type") != "offer"
+            or not isinstance(description.get("sdp"), str) or len(description["sdp"]) > 32768):
         raise TransferFailure("TRANSFER_FAILED")
-    remaining = (datetime.fromisoformat(offer["expiresAt"].replace("Z", "+00:00")) - datetime.now(timezone.utc)).total_seconds()
+    try:
+        remaining = (datetime.fromisoformat(offer["expiresAt"].replace("Z", "+00:00")) - datetime.now(timezone.utc)).total_seconds()
+    except (KeyError, AttributeError, ValueError, TypeError):
+        raise TransferFailure("TRANSFER_FAILED") from None
     if remaining <= 0:
         return False
     peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
@@ -117,7 +137,8 @@ async def serve_offer(offer, library, client, *, timeout=170):
     @peer.on("datachannel")
     def on_data_channel(candidate):
         nonlocal channel
-        if candidate.label != CHANNEL or not candidate.ordered or channel is not None:
+        expected_channel = COVERS_CHANNEL if kind == "covers" else CHANNEL
+        if candidate.label != expected_channel or not candidate.ordered or channel is not None:
             candidate.close()
             return
         channel = candidate
@@ -150,14 +171,21 @@ async def serve_offer(offer, library, client, *, timeout=170):
 
     try:
         async with asyncio.timeout(min(timeout, remaining)):
-            try:
-                path = await asyncio.to_thread(library.epub, book_id)
-            except (KeyError, ValueError, OSError, RuntimeError):
-                raise TransferFailure("BOOK_UNAVAILABLE") from None
-            with path.open("rb") as source:
-                size = os.fstat(source.fileno()).st_size
-                if size <= 0 or size > MAX_EPUB_BYTES:
-                    raise TransferFailure("BOOK_TOO_LARGE")
+            if kind == "covers":
+                payload = await asyncio.to_thread(cover_bundle, library, book_ids)
+                source_context = io.BytesIO(payload)
+                size = len(payload)
+            else:
+                try:
+                    path = await asyncio.to_thread(library.epub, book_id)
+                except (KeyError, ValueError, OSError, RuntimeError):
+                    raise TransferFailure("BOOK_UNAVAILABLE") from None
+                source_context = path.open("rb")
+            with source_context as source:
+                if kind == "epub":
+                    size = os.fstat(source.fileno()).st_size
+                    if size <= 0 or size > MAX_EPUB_BYTES:
+                        raise TransferFailure("BOOK_TOO_LARGE")
                 digest = await asyncio.to_thread(file_digest, source)
                 await peer.setRemoteDescription(RTCSessionDescription(**description))
                 await peer.setLocalDescription(await peer.createAnswer())
@@ -179,8 +207,10 @@ async def serve_offer(offer, library, client, *, timeout=170):
                     nonlocal ended
                     ended = True
 
-                await transmit(channel, source, book_id, size, digest, acknowledged, closed, mark_ended)
-                print("A selected book was saved on the receiving device.", flush=True)
+                await transmit(channel, source, book_id, size, digest, acknowledged, closed, mark_ended,
+                               kind="covers" if kind == "covers" else "book")
+                message = "Library covers were saved" if kind == "covers" else "A selected book was saved"
+                print(f"{message} on the receiving device.", flush=True)
                 return True
     except asyncio.CancelledError:
         raise
@@ -190,7 +220,9 @@ async def serve_offer(offer, library, client, *, timeout=170):
             await asyncio.to_thread(client.request, "POST", f"/api/companion/transfers/{transfer_id}", {"error": code})
         except CompanionError:
             pass  # A cancelled/expired transfer may already have been removed.
-        print(f"A book transfer did not finish ({code}). Retry Save offline on your phone.", flush=True)
+        message = (f"Library covers did not finish ({code}). Retry on your phone." if kind == "covers"
+                   else f"A book transfer did not finish ({code}). Retry Save offline on your phone.")
+        print(message, flush=True)
         return False
     finally:
         await peer.close()

@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import contextlib
 import errno
 import hashlib
@@ -11,11 +12,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from companion import CompanionError, write_config
+from companion import CompanionError, SyncClient, write_config
 
 try:
     from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
-    from transfer import CHANNEL, MAX_EPUB_BYTES, serve_offer, serve_transfers, service_lock
+    from transfer import CHANNEL, COVERS_CHANNEL, MAX_EPUB_BYTES, TransferFailure, serve_offer, serve_transfers, service_lock
     HAS_WEBRTC = True
 except ImportError:
     HAS_WEBRTC = False
@@ -31,10 +32,10 @@ class DirectTransferTest(unittest.IsolatedAsyncioTestCase):
         self.file.write_bytes(self.payload)
         self.library = SimpleNamespace(epub=lambda book_id: self.file)
 
-    async def exchange(self, *, acknowledge=True):
+    async def exchange(self, *, acknowledge=True, kind="epub"):
         peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
         self.addAsyncCleanup(peer.close)
-        channel = peer.createDataChannel(CHANNEL, ordered=True)
+        channel = peer.createDataChannel(COVERS_CHANNEL if kind == "covers" else CHANNEL, ordered=True)
         chunks, messages, calls = [], [], []
         loop = asyncio.get_running_loop()
         answer = loop.create_future()
@@ -63,6 +64,8 @@ class DirectTransferTest(unittest.IsolatedAsyncioTestCase):
         offer = {"id": "transfer-one", "bookId": "BOOK1",
                  "offer": {"type": "offer", "sdp": peer.localDescription.sdp},
                  "expiresAt": (datetime.now(timezone.utc) + timedelta(seconds=40)).isoformat()}
+        if kind == "covers":
+            offer.update(kind="covers", bookIds=["BOOK1", "MISSING"])
         task = asyncio.create_task(serve_offer(offer, self.library, Client(), timeout=20))
         try:
             description = await asyncio.wait_for(answer, 10)
@@ -89,6 +92,40 @@ class DirectTransferTest(unittest.IsolatedAsyncioTestCase):
         result, _, _, calls = await self.exchange(acknowledge=False)
         self.assertFalse(result)
         self.assertEqual(calls[-1][2], {"error": "TRANSFER_FAILED"})
+
+    async def test_real_cover_channel_transfers_bundle_without_epub_or_signal_image_bytes(self):
+        self.library = SimpleNamespace(epub=Mock(side_effect=AssertionError("EPUB must not be opened")),
+                                       cover=Mock(side_effect=[(b"source", "image/png"), KeyError("missing")]))
+        jpeg = b"\xff\xd8\xffprivate-thumbnail"
+        with patch("covers.jpeg_thumbnail", return_value=jpeg):
+            result, chunks, messages, calls = await self.exchange(kind="covers")
+        payload = b"".join(chunks)
+        self.assertTrue(result)
+        self.assertEqual(json.loads(payload), {"version": 1, "covers": [
+            {"id": "BOOK1", "mime": "image/jpeg", "data": base64.b64encode(jpeg).decode()},
+            {"id": "MISSING", "mime": None, "data": None},
+        ]})
+        self.assertEqual(messages[0], {"type": "covers", "bookId": "BOOK1", "size": len(payload),
+                                      "sha256": hashlib.sha256(payload).hexdigest()})
+        self.assertEqual(messages[-1], {"type": "end"})
+        self.library.epub.assert_not_called()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(set(calls[0][2]), {"answer"})
+        self.assertNotIn(base64.b64encode(jpeg).decode(), json.dumps(calls))
+
+    async def test_invalid_cover_offers_do_not_access_library_or_negotiate(self):
+        base = {"id": "transfer-one", "bookId": "BOOK1", "kind": "covers", "bookIds": ["BOOK1"],
+                "offer": {"type": "offer", "sdp": "unused"},
+                "expiresAt": (datetime.now(timezone.utc) + timedelta(seconds=40)).isoformat()}
+        library, client = Mock(), Mock()
+        for changes in ({"kind": "arbitrary"}, {"kind": None}, {"bookIds": None}, {"bookIds": []},
+                        {"bookIds": ["BOOK1", "BOOK1"]}, {"bookIds": ["BOOK2"]},
+                        {"bookIds": ["BOOK1", "../private"]}, {"bookIds": ["BOOK1", 1]},
+                        {"bookIds": ["BOOK1"] + [str(i) for i in range(200)]}, {"bookId": None}):
+            with self.subTest(changes=changes), self.assertRaises(TransferFailure):
+                await serve_offer(base | changes, library, client)
+        self.assertEqual(library.mock_calls, [])
+        self.assertEqual(client.mock_calls, [])
 
     async def test_large_file_is_rejected_before_negotiation_or_read(self):
         with self.file.open("wb") as output:
@@ -146,6 +183,14 @@ class TransferServiceTest(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("simulated stop")
         with service_lock(self.path):
             self.assertEqual(self.path.with_name("transfer-service.lock").stat().st_mode & 0o777, 0o600)
+
+    def test_heartbeat_advertises_cover_transfer_capability(self):
+        opener = Mock()
+        opener.open.return_value = io.BytesIO(b'{"transfers":[]}')
+        SyncClient("https://reader.example", "device_" + "a" * 43, opener=opener).request(
+            "GET", "/api/companion/transfers")
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.get_header("X-books-covers"), "1")
 
     async def test_background_retries_network_failure_at_idle_interval_and_outlives_duration(self):
         self.client.request.side_effect = [CompanionError("Network unavailable"),

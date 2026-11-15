@@ -68,8 +68,11 @@ export class PostgresStore {
       return summary;
     });
     books.sort((a, b) => (b.lastReadAt ?? '').localeCompare(a.lastReadAt ?? '') || a.title.localeCompare(b.title));
-    const devices = await this.pool.query('SELECT transfer_seen_at,revoked_at FROM books_devices WHERE owner_id=$1 AND revoked_at IS NULL', [owner]);
-    return { books, refreshedAt: this.now().toISOString(), bridge: 'cloud', transferReady: devices.rows.some((row) => transferReady(row, this.now())) };
+    const devices = await this.pool.query('SELECT id,transfer_seen_at,revoked_at,covers_supported FROM books_devices WHERE owner_id=$1 AND revoked_at IS NULL', [owner]);
+    const coverDevice = devices.rows.find((row) => row.covers_supported && transferReady(row, this.now()));
+    return { books, refreshedAt: this.now().toISOString(), bridge: 'cloud',
+      transferReady: devices.rows.some((row) => transferReady(row, this.now())),
+      coversReady: !!coverDevice, coverDeviceId: coverDevice?.id ?? null };
   }
 
   async book(owner, bookId) { return detail((await this.rows(owner, bookId))[0]); }
@@ -205,14 +208,23 @@ export class PostgresStore {
       await client.query('DELETE FROM books_transfers WHERE owner_id=$1 AND expires_at<=$2', [owner, this.now()]);
       const book = (await client.query('SELECT source_device_id,metadata FROM books_library WHERE owner_id=$1 AND book_id=$2', [owner, value.bookId])).rows[0];
       if (!book) throw new HttpError(404, 'Book not found.');
-      if (!book.metadata.availableOnMac) throw new HttpError(409, 'Download this EPUB in Apple Books on your Mac first, then sync the library.');
-      const source = (await client.query('SELECT id,transfer_seen_at,revoked_at FROM books_devices WHERE owner_id=$1 AND id=$2 AND revoked_at IS NULL FOR SHARE', [owner, book.source_device_id])).rows[0];
+      if (value.kind === 'covers') {
+        const batch = await client.query('SELECT book_id,source_device_id FROM books_library WHERE owner_id=$1 AND book_id=ANY($2::text[])', [owner, value.bookIds]);
+        if (batch.rows.length !== value.bookIds.length) throw new HttpError(404, 'One or more books were not found in your library.');
+        if (batch.rows.some((row) => row.source_device_id !== book.source_device_id)) {
+          throw new HttpError(409, 'Sync these books from the same linked Mac before loading their covers.');
+        }
+      } else if (!book.metadata.availableOnMac) throw new HttpError(409, 'Download this EPUB in Apple Books on your Mac first, then sync the library.');
+      const source = (await client.query('SELECT id,transfer_seen_at,revoked_at,covers_supported FROM books_devices WHERE owner_id=$1 AND id=$2 AND revoked_at IS NULL FOR SHARE', [owner, book.source_device_id])).rows[0];
       if (!source || !transferReady(source, this.now())) throw new HttpError(503, 'Start transfers on your Mac, keep it awake, and connect both devices to the same Wi-Fi.');
+      if (value.kind === 'covers' && !source.covers_supported) throw new HttpError(409, 'Update and restart your Mac companion to load book covers.');
       const count = await client.query('SELECT count(*)::int AS count FROM books_transfers WHERE owner_id=$1 AND error IS NULL', [owner]);
       if (count.rows[0].count >= 3) throw new HttpError(429, 'Finish or cancel another book download before starting this one.');
       const id = randomUUID(), expiresAt = new Date(this.now().getTime() + 180_000);
-      await client.query(`INSERT INTO books_transfers (id,owner_id,book_id,device_id,offer,created_at,expires_at)
-        VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7)`, [id, owner, value.bookId, source.id, JSON.stringify(value.offer), this.now(), expiresAt]);
+      await client.query(`INSERT INTO books_transfers (id,owner_id,book_id,device_id,offer,created_at,expires_at,kind,book_ids)
+        VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9::jsonb)`,
+      [id, owner, value.bookId, source.id, JSON.stringify(value.offer), this.now(), expiresAt,
+        value.kind === 'covers' ? 'covers' : 'epub', value.kind === 'covers' ? JSON.stringify(value.bookIds) : null]);
       return { id, expiresAt: iso(expiresAt) };
     });
   }
@@ -222,7 +234,8 @@ export class PostgresStore {
       WHERE t.owner_id=$1 AND t.id=$2 AND t.expires_at>$3 AND d.revoked_at IS NULL`, [owner, id, this.now()]);
     if (!rows.length) throw new HttpError(404, 'This transfer expired or was closed. Save the book again.');
     const row = rows[0];
-    return { id: row.id, bookId: row.book_id, status: row.error ? 'failed' : row.answer ? 'answered' : 'waiting', answer: row.answer, error: row.error, expiresAt: iso(row.expires_at) };
+    return { id: row.id, bookId: row.book_id, ...(row.kind === 'covers' ? { kind: 'covers' } : {}),
+      status: row.error ? 'failed' : row.answer ? 'answered' : 'waiting', answer: row.answer, error: row.error, expiresAt: iso(row.expires_at) };
   }
 
   async closeTransfer(owner, id) {
@@ -231,16 +244,18 @@ export class PostgresStore {
     return { ok: true };
   }
 
-  async pendingTransfers(identity) {
+  async pendingTransfers(identity, coversSupported = false) {
     return this.transaction(async (client) => {
       await client.query('SELECT id FROM "user" WHERE id=$1 FOR UPDATE', [identity.owner]);
-      const device = await client.query(`UPDATE books_devices SET transfer_seen_at=$3
-        WHERE owner_id=$1 AND id=$2 AND revoked_at IS NULL RETURNING id`, [identity.owner, identity.id, this.now()]);
+      const device = await client.query(`UPDATE books_devices SET transfer_seen_at=$3,covers_supported=$4
+        WHERE owner_id=$1 AND id=$2 AND revoked_at IS NULL RETURNING id`, [identity.owner, identity.id, this.now(), coversSupported]);
       if (!device.rows.length) throw new HttpError(401, 'Companion has been revoked.');
       await client.query('DELETE FROM books_transfers WHERE owner_id=$1 AND expires_at<=$2', [identity.owner, this.now()]);
-      const { rows } = await client.query(`SELECT id,book_id,offer,expires_at FROM books_transfers
-        WHERE owner_id=$1 AND device_id=$2 AND answer IS NULL AND error IS NULL ORDER BY created_at LIMIT 3`, [identity.owner, identity.id]);
-      return { transfers: rows.map((row) => ({ id: row.id, bookId: row.book_id, offer: row.offer, expiresAt: iso(row.expires_at) })) };
+      const { rows } = await client.query(`SELECT id,book_id,offer,expires_at,kind,book_ids FROM books_transfers
+        WHERE owner_id=$1 AND device_id=$2 AND answer IS NULL AND error IS NULL
+        AND (kind='epub' OR (kind='covers' AND $3::boolean)) ORDER BY created_at LIMIT 3`, [identity.owner, identity.id, coversSupported]);
+      return { transfers: rows.map((row) => ({ id: row.id, bookId: row.book_id,
+        ...(row.kind === 'covers' ? { kind: 'covers', bookIds: row.book_ids } : {}), offer: row.offer, expiresAt: iso(row.expires_at) })) };
     });
   }
 

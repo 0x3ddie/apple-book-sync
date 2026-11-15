@@ -9,6 +9,7 @@ const state = {
   sequence: 0, draft: null, saveQueue: Promise.resolve(),
   navigation: null, libraryRequest: 0, storageWarning: false,
   savedBooks: new Map(), coverUrls: new Map(), downloads: new Map(), bridgeOnline: true,
+  covers: new Map(), coverBackfilled: new Set(), coverSync: null, coverAttemptedAt: 0,
   offlineReady: false, syncingBackups: false,
   accountReady: false, anchorCfi: null,
 };
@@ -120,19 +121,126 @@ function coverHue(text) {
 
 function coverFor(book) {
   const cover = element("div", "cover");
+  cover.dataset.bookId = book.id;
   cover.setAttribute("aria-hidden", "true");
   cover.style.setProperty("--cover-hue", coverHue(`${book.title}${book.author || ""}`));
   cover.append(element("span", "cover-title", book.title), element("span", "cover-author", book.author || ""));
   const coverUrl = state.coverUrls.get(book.id) || (state.bridgeOnline ? book.coverUrl : null);
-  if (coverUrl) {
-    const image = element("img");
+  if (coverUrl) showCover(cover, coverUrl);
+  return cover;
+}
+
+function showCover(cover, url) {
+  let image = cover.querySelector("img");
+  if (!image) {
+    image = element("img");
     image.alt = "";
     image.loading = "lazy";
-    image.src = coverUrl;
     image.addEventListener("error", () => image.remove(), { once: true });
     cover.append(image);
   }
-  return cover;
+  if (image.src !== url) image.src = url;
+}
+
+function rememberCovers(records) {
+  for (const record of records) {
+    // A missing Mac cover must not replace one extracted from a saved EPUB.
+    if (state.covers.get(record.id)?.cover && !record.cover) continue;
+    state.covers.set(record.id, record);
+    if (!record.cover) continue;
+    const previous = state.coverUrls.get(record.id);
+    if (previous) URL.revokeObjectURL(previous);
+    state.coverUrls.set(record.id, URL.createObjectURL(record.cover));
+  }
+  // Update images without rebuilding the shelf or moving keyboard focus.
+  for (const cover of document.querySelectorAll(".cover[data-book-id]")) {
+    const url = state.coverUrls.get(cover.dataset.bookId);
+    if (url) showCover(cover, url);
+  }
+}
+
+function sameAccount(scope) {
+  return state.accountReady && window.ReaderAccount.current?.scope === scope;
+}
+
+function coverStatus(message) {
+  el("cover-status").textContent = message;
+  el("cover-status").hidden = !message;
+}
+
+async function backfillCovers(records, scope) {
+  for (const record of records) {
+    if (!sameAccount(scope)) return;
+    if (state.covers.get(record.id)?.cover || state.coverBackfilled.has(record.id)) continue;
+    state.coverBackfilled.add(record.id);
+    let cover;
+    try { cover = record.cover || await window.BookCovers.fromEpub(record.epub); }
+    catch { continue; /* An unsupported cover does not prevent reading its book. */ }
+    if (!sameAccount(scope)) return;
+    if (!cover) continue;
+    const cached = { id: record.id, cover, checkedAt: new Date().toISOString() };
+    try { await OfflineBooks.putCovers([cached], scope); }
+    catch {
+      if (sameAccount(scope)) coverStatus("Cover images couldn’t be saved on this device.");
+      return;
+    }
+    if (sameAccount(scope)) rememberCovers([cached]);
+  }
+}
+
+async function syncCovers(data, retry = false) {
+  const account = window.ReaderAccount.current;
+  if (!state.accountReady || account?.mode !== "cloud" || !state.offlineReady || state.coverSync) return;
+  const scope = account.scope;
+  const books = data.books.filter((book) => {
+    if (data.coverDeviceId && book.sourceDeviceId !== data.coverDeviceId) return false;
+    const cached = state.covers.get(book.id);
+    return !cached?.cover && (retry || !cached || cached.availableOnMac !== book.availableOnMac
+      || Date.now() - Date.parse(cached.checkedAt) > 6 * 60 * 60 * 1000);
+  });
+  if (!books.length) { coverStatus(""); return; }
+  if (!data.coversReady) {
+    coverStatus("Connect to your Mac on the same Wi-Fi to load missing covers.");
+    return;
+  }
+  if (!retry && Date.now() - state.coverAttemptedAt < 5 * 60 * 1000) return;
+  state.coverAttemptedAt = Date.now();
+  const controller = new AbortController();
+  state.coverSync = controller;
+  coverStatus("Loading covers from your Mac…");
+  try {
+    for (let offset = 0; offset < books.length; offset += 200) {
+      const batch = books.slice(offset, offset + 200);
+      const bookIds = batch.map((book) => book.id);
+      const available = new Map(batch.map((book) => [book.id, book.availableOnMac]));
+      await window.BookTransfer.receive({
+        kind: "covers", bookId: bookIds[0], bookIds, signal: controller.signal,
+        request: (path, options = {}) => {
+          if (!sameAccount(scope)) throw new Error("Your account changed.");
+          const body = options.body;
+          return api(path, { ...options, ...(body === undefined ? {} : { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }) });
+        },
+        save: async (blob) => {
+          const records = await window.BookCovers.readBundle(blob, bookIds);
+          controller.signal.throwIfAborted();
+          if (!sameAccount(scope)) throw new Error("Your account changed.");
+          for (const record of records) record.availableOnMac = available.get(record.id);
+          await OfflineBooks.putCovers(records, scope);
+          if (sameAccount(scope) && !controller.signal.aborted) rememberCovers(records);
+          return records;
+        },
+      });
+    }
+    if (sameAccount(scope)) coverStatus("");
+  } catch (error) {
+    if (sameAccount(scope)) {
+      if (error.name === "AbortError") coverStatus("");
+      else coverStatus(error.name === "QuotaExceededError" ? "There isn’t enough space on this device to save covers."
+        : "Covers couldn’t load. Keep your Mac on the same Wi-Fi, then tap Refresh library to retry.");
+    }
+  } finally {
+    if (state.coverSync === controller) state.coverSync = null;
+  }
 }
 
 function canDownload(book) {
@@ -203,13 +311,14 @@ function updateOfflineStatus() {
 }
 
 async function loadSavedBooks() {
-  const records = await OfflineBooks.list();
-  for (const url of state.coverUrls.values()) URL.revokeObjectURL(url);
-  state.coverUrls.clear();
+  const scope = window.ReaderAccount.current?.scope;
+  const [records, covers] = await Promise.all([OfflineBooks.list(), OfflineBooks.listCovers()]);
+  if (!sameAccount(scope)) return;
+  rememberCovers(covers);
   state.savedBooks = new Map(records.map((record) => [record.id, { id: record.id, detail: record.detail, bytes: record.bytes }]));
-  for (const record of records) if (record.cover) state.coverUrls.set(record.id, URL.createObjectURL(record.cover));
   state.offlineReady = true;
   updateOfflineStatus();
+  backfillCovers(records, scope).catch(() => {});
 }
 
 async function toggleDownload(book) {
@@ -321,14 +430,14 @@ function renderLibrary() {
   el("continue-books").replaceChildren(...continuing.map((book) => bookButton(book, true)));
 }
 
-async function refreshLibrary() {
+async function refreshLibrary({ retryCovers = false } = {}) {
   if (!state.accountReady) return;
   const request = ++state.libraryRequest;
   el("refresh").disabled = true;
   el("library-status").textContent = "Checking your Apple Books library…";
   try {
     const data = await api("/api/library");
-    if (request !== state.libraryRequest) return;
+    if (!state.accountReady || request !== state.libraryRequest) return;
     state.bridgeOnline = true;
     state.books = data.books;
     for (const saved of state.savedBooks.values()) if (!state.books.some((book) => book.id === saved.id)) state.books.push(saved.detail);
@@ -340,6 +449,7 @@ async function refreshLibrary() {
       : `${readable} available on Mac. Updated from Apple Books just now.`;
     showError("library-error", "");
     syncBackups().catch(() => {});
+    syncCovers(data, retryCovers).catch(() => {});
   } catch (error) {
     if (request !== state.libraryRequest) return;
     if (error.status === 401 || error.status === 403) return;
@@ -936,7 +1046,7 @@ for (const button of document.querySelectorAll("[data-filter]")) button.addEvent
   for (const item of document.querySelectorAll("[data-filter]")) item.setAttribute("aria-pressed", String(item === button));
   renderLibrary();
 });
-el("refresh").addEventListener("click", refreshLibrary);
+el("refresh").addEventListener("click", () => refreshLibrary({ retryCovers: true }));
 el("previous").addEventListener("click", () => navigate(() => turnPage(-1)));
 el("next").addEventListener("click", () => navigate(() => turnPage(1)));
 el("back-library").addEventListener("click", finishReading);
@@ -972,12 +1082,17 @@ document.addEventListener("visibilitychange", () => {
 window.addEventListener("pagehide", () => { flushOnHide(); cancelDownloads(); });
 function cancelDownloads() {
   for (const download of state.downloads.values()) download.controller.abort();
+  state.coverSync?.abort();
 }
 window.addEventListener("books-session-expired", cancelDownloads);
 window.addEventListener("books-account-changing", () => {
   cancelDownloads();
   state.accountReady = false;
   state.ready = false;
+  state.libraryRequest++;
+  for (const url of state.coverUrls.values()) URL.revokeObjectURL(url);
+  state.coverUrls.clear();
+  state.covers.clear();
 });
 window.addEventListener("online", () => { if (!state.accountReady) return; if (state.draft) retrySave().catch(() => {}); else if (!state.detail) refreshLibrary(); });
 window.addEventListener("offline", () => {

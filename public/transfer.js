@@ -4,6 +4,7 @@
 // encrypted data channel and are committed to this browser before acknowledging.
 window.BookTransfer = (() => {
   const MAX_BYTES = 128 * 1024 * 1024;
+  const MAX_COVER_BYTES = 16 * 1024 * 1024;
   const connectionHelp = "Keep your Mac awake with transfers running, and connect both devices to the same Wi-Fi. Then try again.";
   const errors = {
     BOOK_UNAVAILABLE: "Download this EPUB in Apple Books on your Mac, then sync and try again.",
@@ -11,11 +12,18 @@ window.BookTransfer = (() => {
     TRANSFER_FAILED: `The Mac could not send this book. ${connectionHelp}`,
   };
 
-  async function receive({ bookId, request, signal, onProgress = () => {}, save }) {
+  async function receive({ bookId, kind = "epub", bookIds, request, signal, onProgress = () => {}, save }) {
+    if (!["epub", "covers"].includes(kind)) throw new Error("Unsupported transfer type.");
+    const covers = kind === "covers";
+    if (covers && (!Array.isArray(bookIds) || !bookIds.length || bookIds.length > 200 || bookIds[0] !== bookId
+      || new Set(bookIds).size !== bookIds.length || bookIds.some((id) => typeof id !== "string" || !/^[A-Za-z0-9._:-]{1,200}$/.test(id)))) {
+      throw new Error("Invalid books for cover transfer.");
+    }
+    const maxBytes = covers ? MAX_COVER_BYTES : MAX_BYTES;
     if (typeof RTCPeerConnection !== "function") throw new Error("Direct book transfer is unavailable in this browser. Try the latest Chrome.");
     if (signal?.aborted) throw new DOMException("Download cancelled.", "AbortError");
     const peer = new RTCPeerConnection({ iceServers: [] });
-    const channel = peer.createDataChannel("books-epub-v1", { ordered: true });
+    const channel = peer.createDataChannel(covers ? "books-covers-v1" : "books-epub-v1", { ordered: true });
     channel.binaryType = "arraybuffer";
     let id, header, received = 0, chunks = [], ended = false, settled = false, answered = false;
     let resolveResult, rejectResult, messageQueue = Promise.resolve(), negotiation;
@@ -79,8 +87,8 @@ window.BookTransfer = (() => {
       let value;
       try { value = JSON.parse(data); } catch { throw new Error("The transfer message is invalid."); }
       if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("The transfer message is invalid.");
-      if (value.type === "book" && !header && !ended) {
-        if (value.bookId !== bookId || !Number.isSafeInteger(value.size) || value.size < 4 || value.size > MAX_BYTES || !/^[a-f0-9]{64}$/.test(value.sha256)) {
+      if (value.type === (covers ? "covers" : "book") && !header && !ended) {
+        if (value.bookId !== bookId || !Number.isSafeInteger(value.size) || value.size < 4 || value.size > maxBytes || !/^[a-f0-9]{64}$/.test(value.sha256)) {
           throw new Error("The Mac sent a different or unsupported book. Please try again.");
         }
         header = value;
@@ -94,12 +102,12 @@ window.BookTransfer = (() => {
         let offset = 0;
         for (const chunk of chunks) { bytes.set(new Uint8Array(chunk), offset); offset += chunk.byteLength; }
         chunks = [];
-        if (bytes[0] !== 0x50 || bytes[1] !== 0x4b || bytes[2] !== 0x03 || bytes[3] !== 0x04) throw new Error("The transferred file is not an EPUB archive.");
+        if (!covers && (bytes[0] !== 0x50 || bytes[1] !== 0x4b || bytes[2] !== 0x03 || bytes[3] !== 0x04)) throw new Error("The transferred file is not an EPUB archive.");
         const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((value) => value.toString(16).padStart(2, "0")).join("");
         if (digest !== header.sha256) throw new Error("The book failed its integrity check. Please save it again.");
         if (settled) return;
         onProgress({ phase: "saving", received, total: header.size });
-        const stored = await save(new Blob([bytes], { type: "application/epub+zip" }));
+        const stored = await save(new Blob([bytes], { type: covers ? "application/json" : "application/epub+zip" }));
         if (settled) return;
         // A receipt means the complete, checked book is durable on this device.
         if (channel.readyState === "open") channel.send(JSON.stringify({ type: "received" }));
@@ -129,14 +137,14 @@ window.BookTransfer = (() => {
       if (settled) return;
       await gather();
       if (settled) return;
-      const created = await request("/api/transfers", { method: "POST", body: { bookId, offer: { type: "offer", sdp: peer.localDescription.sdp } } });
+      const created = await request("/api/transfers", { method: "POST", body: { bookId, ...(covers ? { kind: "covers", bookIds } : {}), offer: { type: "offer", sdp: peer.localDescription.sdp } } });
       if (typeof created.id !== "string" || !/^[A-Za-z0-9_-]{1,200}$/.test(created.id)) throw new Error("The server could not start this transfer.");
       id = created.id;
       if (settled) { await cleanupSignal(); return; }
       while (!settled && !answered) {
         const session = await request(`/api/transfers/${encodeURIComponent(id)}`);
         if (settled) return;
-        if (session.bookId !== bookId) throw new Error("The transfer does not match the selected book.");
+        if (session.bookId !== bookId || (covers ? session.kind !== "covers" : session.kind && session.kind !== "epub")) throw new Error("The transfer does not match the selected book.");
         if (session.status === "failed") throw new Error(errors[session.error] || "The Mac could not send this book. Please try again.");
         if (session.status === "answered") {
           if (session.answer?.type !== "answer" || typeof session.answer.sdp !== "string") throw new Error("The Mac returned an invalid connection response.");

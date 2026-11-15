@@ -141,6 +141,23 @@ class LibraryTest(unittest.TestCase):
                 self.api.entry(self.epub, "META-INF/container.xml")
             read.assert_not_called()
 
+    def test_cover_member_limit_and_cloud_placeholder_prevent_cover_reads(self):
+        with self.assertRaisesRegex(ValueError, "too large"):
+            self.api.cover("one", max_size=2)
+        real_stat = Path.stat
+
+        def stat(path, *args, **kwargs):
+            if path == self.epub:
+                return SimpleNamespace(st_flags=SF_DATALESS)
+            return real_stat(path, *args, **kwargs)
+
+        with patch.object(Path, "stat", stat), \
+             patch.object(Path, "read_bytes") as read, patch("library.zipfile.ZipFile") as archive:
+            with self.assertRaises(KeyError):
+                self.api.cover("one")
+            read.assert_not_called()
+            archive.assert_not_called()
+
     def test_http_origin_and_revision_boundaries(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         server.library = self.api

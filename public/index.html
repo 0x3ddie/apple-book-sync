@@ -14,6 +14,7 @@
   <script defer src="/account.js"></script>
   <script defer src="/offline.js"></script>
   <script defer src="/transfer.js"></script>
+  <script defer src="/covers.js"></script>
   <script defer src="/reader.js"></script>
 </head>
 <body>
@@ -50,6 +51,7 @@
       <button id="refresh" class="quiet-button" type="button">Refresh from Books</button>
     </header>
     <div class="library-meta"><p id="library-status" role="status">Reading your Apple Books library…</p><span class="local-label">Mac preview</span></div>
+    <p id="cover-status" class="cover-status" role="status" hidden></p>
     <p id="library-error" class="error-message" role="alert" hidden></p>
     <section id="continue-section" class="continue-section" aria-labelledby="continue-heading" hidden>
       <h2 id="continue-heading">Continue Reading</h2>

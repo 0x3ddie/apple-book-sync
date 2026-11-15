@@ -82,7 +82,7 @@ class SyncClient:
         body = encode(payload) if payload is not None else None
         if body is not None and len(body) > MAX_BODY:
             raise CompanionError("A metadata request exceeds the 1 MiB limit.")
-        headers = {"Accept": "application/json"}
+        headers = {"Accept": "application/json", "X-Books-Covers": "1"}
         if body is not None:
             headers["Content-Type"] = "application/json"
         if self.credential:

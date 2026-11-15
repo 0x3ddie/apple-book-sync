@@ -1,8 +1,8 @@
 # Apple Book Sync
 
-Read EPUBs from your Apple Books library on your Android phone, in your browser. Browse your library, see your Apple Books highlights and bookmarks, and save books for offline reading.
+Read EPUBs from your Apple Books library on your Android phone, in your browser. Browse your library with book covers, see your Apple Books highlights and bookmarks, and save books for offline reading.
 
-A companion on your Mac connects your library to your private account. EPUBs travel directly from your Mac to your phone; Vercel only handles login and sync data.
+A companion on your Mac connects your library to your private account. EPUBs and cover images travel directly from your Mac to your phone; Vercel only handles login and sync data.
 
 **[Open the web app →](https://apple-book-sync.vercel.app)**
 

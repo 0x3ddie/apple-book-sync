@@ -308,7 +308,7 @@ class BooksLibrary:
                     temporary.unlink(missing_ok=True)
         return destination
 
-    def cover(self, book_id):
+    def cover(self, book_id, *, max_size=20 * 1024 * 1024):
         raw = self.raw_book(book_id)
         available, reason = self.readable(raw)
         if not available:
@@ -332,4 +332,4 @@ class BooksLibrary:
         mime = item.attrib.get("media-type") or mimetypes.guess_type(member)[0]
         if mime not in ("image/jpeg", "image/png", "image/gif", "image/webp"):
             raise KeyError("No supported cover image")
-        return self.entry(source, member), mime
+        return self.entry(source, member, max_size), mime
