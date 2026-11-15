@@ -107,30 +107,37 @@ def _fresh_position(actual, previous):
         return False
 
 
-def apply_position(library, book_id, cfi, *, opener=None, sleep=time.sleep, clock=time.monotonic,
-                   cancelled=lambda: False):
-    """Return Books' verified position, or None if it has not saved the jump.
+def _receipt(delivered=False, confirmed=False, actual=None):
+    return {"delivered": delivered, "confirmed": confirmed, "applePosition": actual}
 
-    The caller keeps unconfirmed revisions pending. Only Books writes its
-    private stores; this function reads the requested book's existing records.
+
+def deliver_position(library, book_id, cfi, *, opener=None, sleep=time.sleep, clock=time.monotonic,
+                     cancelled=lambda: False):
+    """Distinguish successful URL delivery from a verified saved position.
+
+    Books may save the left page of a spread when the target is on the right.
+    Such a URL delivery is reported honestly without claiming exact readback.
+    Only Books writes its private stores; this function reads existing records.
     """
     if not isinstance(book_id, str) or not _IDENTIFIER.fullmatch(book_id):
         raise ValueError("Invalid book identifier")
     target = _location(cfi)
     opener = opener or _open_url
+    delivered = False
+    last_actual = None
     try:
         if cancelled():
-            return None
+            return _receipt()
         raw = library.raw_book(book_id)
         if not library.readable(raw)[0]:
-            return None
+            return _receipt()
         previous = library.apple_position(library.raw_annotations(book_id))
         previous_location = None
         if previous:
             try:
                 previous_location = _location(previous.get("cfi"))
                 if previous_location == target:
-                    return previous
+                    return _receipt(True, True, previous) if not cancelled() else _receipt()
             except ValueError:
                 pass
         url = f"ibooks://assetid/{quote(book_id, safe='')}#{quote(cfi, safe='()/!,;:=@')}"
@@ -138,14 +145,16 @@ def apply_position(library, book_id, cfi, *, opener=None, sleep=time.sleep, cloc
         # One retry allows its library window to open the requested passage.
         for _ in range(2):
             if cancelled():
-                return None
+                return _receipt()
             if not opener(url):
                 continue
+            delivered = True
             deadline = clock() + _READBACK_SECONDS
             while True:
                 if cancelled():
-                    return None
+                    return _receipt()
                 actual = library.apple_position(library.raw_annotations(book_id))
+                last_actual = actual
                 if _fresh_position(actual, previous):
                     try:
                         actual_location = _location(actual.get("cfi"))
@@ -154,7 +163,7 @@ def apply_position(library, book_id, cfi, *, opener=None, sleep=time.sleep, cloc
                         # when Books also moved to a different text node.
                         moved_node = actual_location[:2] != (previous_location[:2] if previous_location else None)
                         if actual_location == target or actual_location[:2] == target[:2] and moved_node:
-                            return actual
+                            return _receipt(True, True, actual) if not cancelled() else _receipt()
                     except ValueError:
                         pass
                 remaining = deadline - clock()
@@ -162,5 +171,13 @@ def apply_position(library, book_id, cfi, *, opener=None, sleep=time.sleep, cloc
                     break
                 sleep(min(0.25, remaining))
     except (KeyError, OSError, RuntimeError, ValueError):
-        return None
-    return None
+        pass
+    return _receipt(delivered, False, last_actual) if not cancelled() else _receipt()
+
+
+def apply_position(library, book_id, cfi, *, opener=None, sleep=time.sleep, clock=time.monotonic,
+                   cancelled=lambda: False):
+    """Return only a verified saved position; delivery alone is not proof."""
+    result = deliver_position(library, book_id, cfi, opener=opener, sleep=sleep,
+                              clock=clock, cancelled=cancelled)
+    return result["applePosition"] if result["confirmed"] else None

@@ -7,12 +7,16 @@ const transferReady = (row, now) => !row.revoked_at && row.transfer_seen_at != n
   && new Date(row.transfer_seen_at).getTime() > now.getTime() - 30_000;
 export function syncState(apple, web, sourceDeviceId) {
   if (!web) return apple ? 'apple' : 'empty';
-  const applied = web.applied;
-  if (!applied || sourceDeviceId && applied.deviceId !== sourceDeviceId) return 'pending';
+  const current = (marker) => marker && (!sourceDeviceId || marker.deviceId === sourceDeviceId);
+  const applied = current(web.applied) ? web.applied : null;
+  const delivered = current(web.delivered) ? web.delivered : null;
+  const marker = applied ?? delivered;
+  if (!marker) return 'pending';
   // An older snapshot can arrive after acknowledgement. Only subsequent Apple
   // reading takes over once this exact web revision has been applied.
-  return apple && apple.revision !== applied.applePosition.revision
-    && Date.parse(apple.updatedAt) > Date.parse(applied.applePosition.updatedAt) ? 'apple' : 'synced';
+  const baseline = marker.applePosition;
+  return apple && baseline && apple.cfi !== baseline.cfi
+    && Date.parse(apple.updatedAt) > Date.parse(baseline.updatedAt) ? 'apple' : applied ? 'synced' : 'sent';
 }
 
 function detail(row) {
@@ -283,6 +287,13 @@ export class PostgresStore {
           VALUES ($1,$2,$3,$4::jsonb,$5) ON CONFLICT (owner_id,book_id) DO UPDATE
           SET source_device_id=EXCLUDED.source_device_id, metadata=EXCLUDED.metadata, imported_at=EXCLUDED.imported_at`,
         [identity.owner, book.id, identity.id, JSON.stringify(book), this.now()]);
+        // A URL handoff can succeed without a CFI being available yet. Its
+        // first later Apple position becomes a baseline, not a resume change.
+        if (book.applePosition) await client.query(`UPDATE books_positions
+          SET position=jsonb_set(position,'{delivered,applePosition}',$3::jsonb)
+          WHERE owner_id=$1 AND book_id=$2 AND position->'delivered'->>'deviceId'=$4
+          AND position->'delivered'->'applePosition'='null'::jsonb`,
+        [identity.owner, book.id, JSON.stringify(book.applePosition), identity.id]);
       }
       await client.query('UPDATE books_devices SET snapshot_sequence=$3,last_seen_at=$4 WHERE owner_id=$1 AND id=$2', [identity.owner, identity.id, value.sequence, this.now()]);
       return { ok: true, imported: value.books.length, sequence: value.sequence };
@@ -302,7 +313,7 @@ export class PostgresStore {
     return { positions, refreshedAt: this.now().toISOString() };
   }
 
-  async acknowledgePosition(identity, bookId, value) {
+  async acknowledgePosition(identity, bookId, value, confirmed = true) {
     return this.transaction(async (client) => {
       const device = await client.query('SELECT id FROM books_devices WHERE owner_id=$1 AND id=$2 AND revoked_at IS NULL FOR SHARE', [identity.owner, identity.id]);
       if (!device.rows.length) throw new HttpError(401, 'Companion has been revoked.');
@@ -313,7 +324,8 @@ export class PostgresStore {
         throw new HttpError(409, 'A newer web position is waiting. Read the pending position again.');
       }
       if (position.applied?.deviceId === identity.id) return { ok: true, ignored: true, revision: position.revision };
-      position.applied = { deviceId: identity.id, at: this.now().toISOString(), applePosition: value.applePosition };
+      if (!confirmed && position.delivered?.deviceId === identity.id) return { ok: true, ignored: true, revision: position.revision };
+      position[confirmed ? 'applied' : 'delivered'] = { deviceId: identity.id, at: this.now().toISOString(), applePosition: value.applePosition };
       await client.query('UPDATE books_positions SET position=$3::jsonb WHERE owner_id=$1 AND book_id=$2', [identity.owner, bookId, JSON.stringify(position)]);
       return { ok: true, revision: position.revision };
     });

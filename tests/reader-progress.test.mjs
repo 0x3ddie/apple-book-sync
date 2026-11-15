@@ -188,3 +188,39 @@ test('reconnecting checks a previously saved pending position without another bu
   assert.equal(qa.state.bridgeOnline, true);
   assert.equal(qa.get('reader-status').textContent, 'Synced with Apple Books');
 });
+
+
+test('native delivery stops waiting and says sent without claiming verified sync', async () => {
+  const sent = detail({ syncState: 'sent', webPosition: web({ delivered: { deviceId: 'mac', applePosition: null } }) });
+  const qa = setup({ response: () => sent });
+  qa.state.detail = detail(); qa.context.watchAppleSync();
+  await qa.tick();
+  assert.equal(qa.get('reader-status').textContent, 'Sent to Apple Books');
+  assert.equal(qa.get('save-detail').textContent, 'Your Mac sent this position to Apple Books.');
+  assert.equal(qa.timers.size, 0);
+  assert.equal(qa.state.detail.syncState, 'sent');
+  const selected = await qa.context.resolvePosition(sent);
+  assert.equal(selected.source, 'web'); assert.equal(selected.cfi, cfi(10));
+  assert.equal(qa.context.syncMessage(sent), 'Your Mac sent this position to Apple Books.');
+  qa.context.watchAppleSync();
+  assert.equal(qa.timers.size, 0, 'A delivered position must not keep polling as if delivery failed');
+});
+
+test('an idempotent save response with delivery remains sent rather than confirmed', async () => {
+  const qa = setup({ response: (_path, options) => ({ position: { ...JSON.parse(options.body), revision: 5 }, syncState: 'sent', ignored: true }) });
+  qa.state.detail = detail();
+  await qa.context.saveDraft(qa.context.markDraft(cfi(12), 'chapter.xhtml'));
+  assert.equal(qa.get('reader-status').textContent, 'Sent to Apple Books');
+  assert.equal(qa.get('save-detail').textContent, 'Your Mac sent this position to Apple Books.');
+  assert.equal(qa.timers.size, 0);
+});
+
+
+test('later Apple progress after delivery is not described as exact web-position confirmation', async () => {
+  const qa = setup({ response: () => detail({ syncState: 'apple', resume: { cfi: cfi(20), source: 'apple' }, webPosition: web({ delivered: { deviceId: 'mac' } }) }) });
+  qa.state.detail = detail(); qa.context.watchAppleSync();
+  await qa.tick();
+  assert.equal(qa.get('reader-status').textContent, 'Apple Books progress updated');
+  assert.equal(qa.get('save-detail').textContent, 'Your next session will resume from Apple Books.');
+  assert.equal(qa.timers.size, 0);
+});

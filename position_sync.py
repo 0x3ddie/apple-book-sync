@@ -1,10 +1,15 @@
-"""Apply pending web positions on this Mac and acknowledge verified read-back."""
+"""Deliver web positions once, distinguishing dispatch from verified read-back."""
 
 import asyncio
+import json
+import os
 import re
+import stat
+import tempfile
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 
 from companion import CompanionError, MAX_SEQUENCE
 
@@ -12,6 +17,7 @@ from companion import CompanionError, MAX_SEQUENCE
 DEBOUNCE_SECONDS = 5
 RETRY_SECONDS = 60
 MAX_PER_POLL = 3
+MAX_RECEIPTS_BYTES = 1024 * 1024
 
 
 def _timestamp(value):
@@ -41,6 +47,17 @@ def _apple_position(value):
     return {field: value[field] for field in ("cfi", "revision", "updatedAt")}
 
 
+def _receipt(value):
+    if not isinstance(value, dict) or value.get("phase") not in ("applied", "delivered"):
+        raise ValueError("Invalid position receipt")
+    observed = value.get("applePosition")
+    if observed is not None:
+        observed = _apple_position(observed)
+    elif value["phase"] == "applied":
+        raise ValueError("Missing verified position")
+    return {"phase": value["phase"], "applePosition": observed}
+
+
 def _pending(response, device_id):
     if not isinstance(response, dict) or not isinstance(response.get("positions"), list):
         raise CompanionError("The sync service returned invalid pending positions.")
@@ -57,14 +74,18 @@ def _pending(response, device_id):
             if type(revision) is not int or not 1 <= revision <= MAX_SEQUENCE:
                 raise ValueError("Invalid web revision")
             saved = _timestamp(position.get("savedAt"))
-            applied = position.get("applied")
-            if applied is not None:
-                if not isinstance(applied, dict) or not _identifier(applied.get("deviceId")):
-                    raise ValueError("Invalid applied position")
-                _timestamp(applied.get("at"))
-                _apple_position(applied.get("applePosition"))
-                if applied["deviceId"] == device_id:
+            delivered_here = False
+            for field in ("applied", "delivered"):
+                marker = position.get(field)
+                if marker is None:
                     continue
+                if not isinstance(marker, dict) or not _identifier(marker.get("deviceId")):
+                    raise ValueError("Invalid position receipt")
+                _timestamp(marker.get("at"))
+                _receipt({"phase": field, "applePosition": marker.get("applePosition")})
+                delivered_here |= marker["deviceId"] == device_id
+            if delivered_here:
+                continue
             if item.get("syncState", "pending") != "pending":
                 continue
             result.append({"key": (item["bookId"], revision, position["cfi"]), "saved": saved})
@@ -74,12 +95,85 @@ def _pending(response, device_id):
 
 
 class PositionSync:
-    def __init__(self, client, library, *, device_id, apply=None, clock=time.time):
+    def __init__(self, client, library, *, device_id, apply=None, clock=time.time, cache_path=None):
         self.client, self.library = client, library
         self.device_id, self.apply, self.clock = device_id, apply, clock
         self.cancelled = threading.Event()
         self.receipts = {}
         self.retry_after = {}
+        self.cache_path = Path(cache_path) if cache_path is not None else None
+        if not _identifier(device_id):
+            raise CompanionError("The companion device identifier is invalid.")
+        self.receipts = self._load_receipts()
+
+    @staticmethod
+    def _private_file(info):
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise CompanionError("The position receipt cache must be an owned private regular file.")
+
+    def _load_receipts(self):
+        if self.cache_path is None:
+            return {}
+        try:
+            try:
+                self._private_file(self.cache_path.lstat())
+            except FileNotFoundError:
+                return {}
+            descriptor = os.open(self.cache_path, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(descriptor, "rb") as source:
+                self._private_file(os.fstat(source.fileno()))
+                data = source.read(MAX_RECEIPTS_BYTES + 1)
+            if len(data) > MAX_RECEIPTS_BYTES:
+                raise ValueError("Oversized receipts")
+            value = json.loads(data)
+            if (not isinstance(value, dict) or type(value.get("version")) is not int or value["version"] != 1
+                    or not _identifier(value.get("deviceId")) or not isinstance(value.get("receipts"), list)):
+                raise ValueError("Invalid receipt cache")
+            if value["deviceId"] != self.device_id:
+                self._save_receipts()  # Re-pairing cannot replay another device's receipts.
+                return {}
+            receipts = {}
+            for item in value["receipts"]:
+                if (not isinstance(item, dict) or not _identifier(item.get("bookId")) or not _cfi(item.get("cfi"))
+                        or type(item.get("revision")) is not int or not 1 <= item["revision"] <= MAX_SEQUENCE):
+                    raise ValueError("Invalid cached target")
+                key = (item["bookId"], item["revision"], item["cfi"])
+                if key in receipts:
+                    raise ValueError("Duplicate cached target")
+                receipts[key] = _receipt(item)
+            return receipts
+        except (OSError, ValueError, TypeError, OverflowError):
+            raise CompanionError("The position receipt cache could not be read safely.") from None
+
+    def _save_receipts(self):
+        if self.cache_path is None:
+            return
+        temporary = None
+        try:
+            directory = self.cache_path.parent.lstat()
+            if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.getuid() or directory.st_mode & 0o077:
+                raise CompanionError("The position receipt cache needs a private companion directory.")
+            try:
+                self._private_file(self.cache_path.lstat())
+            except FileNotFoundError:
+                pass
+            data = json.dumps({"version": 1, "deviceId": self.device_id, "receipts": [
+                {"bookId": key[0], "revision": key[1], "cfi": key[2], **receipt}
+                for key, receipt in self.receipts.items()
+            ]}, separators=(",", ":"), allow_nan=False).encode()
+            if len(data) > MAX_RECEIPTS_BYTES:
+                raise ValueError("Oversized receipts")
+            descriptor, temporary = tempfile.mkstemp(prefix=".progress-receipts-", dir=self.cache_path.parent)
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(data)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, self.cache_path)
+        except (OSError, ValueError):
+            raise CompanionError("The position receipt could not be saved on this Mac.") from None
+        finally:
+            if temporary is not None:
+                Path(temporary).unlink(missing_ok=True)
 
     def clear(self):
         self.cancelled.set()
@@ -96,8 +190,8 @@ class PositionSync:
             return None
         apply = self.apply
         if apply is None:
-            from progress import apply_position
-            apply = apply_position
+            from progress import deliver_position
+            apply = deliver_position
         return apply(self.library, book_id, cfi, cancelled=self.cancelled.is_set)
 
     async def poll(self):
@@ -108,7 +202,10 @@ class PositionSync:
             return
         pending = _pending(response, self.device_id)
         current = {item["key"] for item in pending}
-        self.receipts = {key: value for key, value in self.receipts.items() if key in current}
+        kept = {key: value for key, value in self.receipts.items() if key in current}
+        if len(kept) != len(self.receipts):
+            self.receipts = kept
+            self._save_receipts()
         self.retry_after = {key: value for key, value in self.retry_after.items() if key in current}
         eligible = [item for item in pending if self.clock() - item["saved"] >= DEBOUNCE_SECONDS
                     and self.clock() >= self.retry_after.get(item["key"], 0)][:MAX_PER_POLL]
@@ -127,19 +224,27 @@ class PositionSync:
                     if key not in {entry["key"] for entry in _pending(response, self.device_id)}:
                         continue
                 try:
-                    observed = await asyncio.to_thread(self._apply, book_id, cfi)
+                    delivery = await asyncio.to_thread(self._apply, book_id, cfi)
                     if self.cancelled.is_set():
                         return
-                    observed = _apple_position(observed)
+                    if (not isinstance(delivery, dict) or delivery.get("delivered") is not True
+                            or type(delivery.get("confirmed")) is not bool):
+                        raise ValueError("Position was not delivered")
+                    receipt = _receipt({"phase": "applied" if delivery["confirmed"] else "delivered",
+                                        "applePosition": delivery.get("applePosition")})
                 except (OSError, RuntimeError, ValueError, TypeError):
                     self.retry_after[key] = self.clock() + RETRY_SECONDS
                     continue
-                self.receipts[key] = observed
+                self.receipts[key] = receipt
             if self.cancelled.is_set():
                 return
+            # Persist the result before sending it. An offline ACK or process
+            # restart must not reopen a position already delivered to Books.
+            self._save_receipts()
+            receipt = self.receipts[key]
             try:
-                result = await asyncio.to_thread(self._request, "POST", f"/api/companion/positions/{book_id}/applied", {
-                    "revision": revision, "cfi": cfi, "applePosition": self.receipts[key],
+                result = await asyncio.to_thread(self._request, "POST", f"/api/companion/positions/{book_id}/{receipt['phase']}", {
+                    "revision": revision, "cfi": cfi, "applePosition": receipt["applePosition"],
                 })
                 if self.cancelled.is_set():
                     return
@@ -149,10 +254,13 @@ class PositionSync:
                 if error.status == 409:
                     self.receipts.pop(key, None)
                     self.retry_after.pop(key, None)
+                    self._save_receipts()
                     continue
-                # Keep verified read-back after a failed ACK. The next poll can
-                # acknowledge it without reopening or resetting Apple Books.
+                # Keep the durable delivery or read-back after a failed ACK.
+                # The next poll can acknowledge it without reopening Books.
                 raise
             self.receipts.pop(key, None)
             self.retry_after.pop(key, None)
-            print("Reading position synced to Apple Books.", flush=True)
+            self._save_receipts()
+            print("Reading position synced to Apple Books." if receipt["phase"] == "applied"
+                  else "Reading position sent to Apple Books.", flush=True)

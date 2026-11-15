@@ -2,7 +2,7 @@ import { Pool } from 'pg';
 import { configuration } from './config.mjs';
 import { createAuth } from './auth.mjs';
 import { PostgresStore } from './store.mjs';
-import { HttpError, appliedPosition, fields, identifier, jsonBody, position, snapshot, string, transferRequest, transferAnswer } from './validation.mjs';
+import { HttpError, appliedPosition, deliveredPosition, fields, identifier, jsonBody, position, snapshot, string, transferRequest, transferAnswer } from './validation.mjs';
 
 export function json(status, body) {
   return Response.json(body, { status, headers: {
@@ -73,9 +73,13 @@ export function createHandler({ store, auth, origin }) {
           return reply(200, await store.importSnapshot(device, snapshot(await jsonBody(request, 1_048_576))));
         }
         if (path === '/api/companion/positions' && method === 'GET') return reply(200, await store.positions(device));
-        const appliedMatch = path.match(/^\/api\/companion\/positions\/([^/]+)\/applied$/);
-        if (appliedMatch && method === 'POST') return reply(200, await store.acknowledgePosition(device,
-          identifier(decodeURIComponent(appliedMatch[1])), appliedPosition(await jsonBody(request, 32_768))));
+        const receiptMatch = path.match(/^\/api\/companion\/positions\/([^/]+)\/(applied|delivered)$/);
+        if (receiptMatch && method === 'POST') {
+          const confirmed = receiptMatch[2] === 'applied';
+          const validate = confirmed ? appliedPosition : deliveredPosition;
+          return reply(200, await store.acknowledgePosition(device,
+            identifier(decodeURIComponent(receiptMatch[1])), validate(await jsonBody(request, 32_768)), confirmed));
+        }
         if (path === '/api/companion/transfers' && method === 'GET') {
           return reply(200, await store.pendingTransfers(device, request.headers.get('x-books-covers') === '1'));
         }

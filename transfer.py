@@ -250,7 +250,8 @@ async def _serve_transfers(*, minutes, path, background):
     next_sync = 0
     connected = False
     connection_warning = False
-    positions = PositionSync(client, library, device_id=config["deviceId"])
+    positions = PositionSync(client, library, device_id=config["deviceId"],
+                             cache_path=Path(path).with_name("progress-receipts.json"))
     position_task = None
     next_position_poll = 0
 

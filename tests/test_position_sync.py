@@ -1,10 +1,13 @@
 import asyncio
 import copy
 import io
+import json
+import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import Mock
 
 from companion import CompanionError
@@ -28,13 +31,17 @@ def actual():
     return {"cfi": "epubcfi(/6/2!/4/110/1,:0,:1)", "revision": "apple-readback", "updatedAt": stamp(NOW)}
 
 
+def delivery(confirmed=True):
+    return {"delivered": True, "confirmed": confirmed, "applePosition": actual()}
+
+
 class PositionSyncTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.now = NOW
         self.pending = [item()]
         self.posts = []
         self.library = Mock()
-        self.apply = Mock(return_value=actual())
+        self.apply = Mock(return_value=delivery())
         self.client = Mock()
         self.client.request.side_effect = self.request
         self.sync = PositionSync(self.client, self.library, device_id="this-mac", apply=self.apply, clock=lambda: self.now)
@@ -70,7 +77,7 @@ class PositionSyncTest(unittest.IsolatedAsyncioTestCase):
         await self.sync.poll()
         self.assertEqual(self.apply.call_count, 1)
         self.pending = [item(revision=2)]
-        self.apply.return_value = actual()
+        self.apply.return_value = delivery()
         await self.sync.poll()
         self.assertEqual(self.apply.call_count, 2)
         self.assertEqual(self.posts[0][1]["revision"], 2)
@@ -163,7 +170,7 @@ class PositionSyncTest(unittest.IsolatedAsyncioTestCase):
         def apply(*args, cancelled):
             self.sync.clear()
             self.assertTrue(cancelled())
-            return actual()
+            return delivery()
 
         self.apply.side_effect = apply
         await self.sync.poll()
@@ -204,7 +211,7 @@ class PositionSyncTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotEqual(threading.get_ident(), main_thread)
             entered.set()
             release.wait(3)
-            return actual()
+            return delivery()
 
         self.apply.side_effect = apply
         task = asyncio.create_task(self.sync.poll())
@@ -214,6 +221,97 @@ class PositionSyncTest(unittest.IsolatedAsyncioTestCase):
         finally:
             release.set()
             await task
+
+    async def test_unconfirmed_dispatch_uses_delivered_route_instead_of_claiming_verified_sync(self):
+        self.apply.return_value = delivery(confirmed=False)
+        await self.sync.poll()
+        self.assertEqual(self.posts[0][0], "/api/companion/positions/BOOK1/delivered")
+        self.assertEqual(self.posts[0][1]["applePosition"], actual())
+
+    async def test_dispatched_position_without_cfi_can_record_a_null_baseline(self):
+        self.apply.return_value = {"delivered": True, "confirmed": False, "applePosition": None}
+        await self.sync.poll()
+        self.assertEqual(self.posts[0][0], "/api/companion/positions/BOOK1/delivered")
+        self.assertIsNone(self.posts[0][1]["applePosition"])
+
+    async def test_delivered_marker_for_this_mac_prevents_reopening_without_claiming_applied(self):
+        self.pending[0]["position"]["delivered"] = {"deviceId": "this-mac", "at": stamp(NOW), "applePosition": None}
+        await self.sync.poll()
+        self.apply.assert_not_called()
+        self.pending[0]["position"]["delivered"]["deviceId"] = "previous-mac"
+        await self.sync.poll()
+        self.apply.assert_called_once()
+
+    async def test_durable_receipt_survives_restart_and_is_replayed_without_reopening(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "progress-receipts.json"
+            sync = PositionSync(self.client, self.library, device_id="this-mac", apply=self.apply,
+                                clock=lambda: self.now, cache_path=path)
+            self.apply.return_value = delivery(confirmed=False)
+
+            def request(method, endpoint, payload=None):
+                if method == "POST":
+                    cached = json.loads(path.read_text())
+                    self.assertEqual(cached["receipts"][0]["phase"], "delivered")
+                    self.assertEqual(cached["receipts"][0]["revision"], payload["revision"])
+                    raise CompanionError("Network unavailable")
+                return self.request(method, endpoint, payload)
+
+            self.client.request.side_effect = request
+            with self.assertRaises(CompanionError):
+                await sync.poll()
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            sync.clear()
+            self.assertEqual(len(json.loads(path.read_text())["receipts"]), 1)
+            restarted = PositionSync(self.client, self.library, device_id="this-mac", apply=self.apply,
+                                     clock=lambda: self.now, cache_path=path)
+            self.client.request.side_effect = self.request
+            await restarted.poll()
+            self.assertEqual(self.apply.call_count, 1)
+            self.assertEqual(self.posts[0][0], "/api/companion/positions/BOOK1/delivered")
+            self.assertEqual(json.loads(path.read_text())["receipts"], [])
+
+    async def test_repaired_device_purges_old_receipts_and_never_replays_them(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "progress-receipts.json"
+            cached = {"version": 1, "deviceId": "old-mac", "receipts": [{
+                "bookId": "BOOK1", "revision": 1, "cfi": item()["position"]["cfi"],
+                "phase": "delivered", "applePosition": actual(),
+            }]}
+            path.write_text(json.dumps(cached)); path.chmod(0o600)
+            sync = PositionSync(self.client, self.library, device_id="this-mac", apply=self.apply,
+                                clock=lambda: self.now, cache_path=path)
+            self.assertEqual(json.loads(path.read_text())["receipts"], [])
+            await sync.poll()
+            self.apply.assert_called_once()
+
+    async def test_fresh_pending_revision_must_match_before_replaying_a_durable_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "progress-receipts.json"
+            cached = {"version": 1, "deviceId": "this-mac", "receipts": [{
+                "bookId": "BOOK1", "revision": 1, "cfi": item()["position"]["cfi"],
+                "phase": "delivered", "applePosition": actual(),
+            }]}
+            path.write_text(json.dumps(cached)); path.chmod(0o600)
+            self.pending = [item(revision=2)]
+            sync = PositionSync(self.client, self.library, device_id="this-mac", apply=self.apply,
+                                clock=lambda: self.now, cache_path=path)
+            await sync.poll()
+            self.apply.assert_called_once()
+            self.assertEqual(self.posts[0][1]["revision"], 2)
+
+    def test_cache_rejects_symlinks_or_readable_by_other_users(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "target"
+            target.write_text('{}'); target.chmod(0o600)
+            path = Path(temporary) / "progress-receipts.json"
+            path.symlink_to(target)
+            with self.assertRaises(CompanionError):
+                PositionSync(self.client, self.library, device_id="this-mac", cache_path=path)
+            path.unlink()
+            target.chmod(0o644)
+            with self.assertRaises(CompanionError):
+                PositionSync(self.client, self.library, device_id="this-mac", cache_path=target)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ A companion on your Mac connects your library to your private account. EPUBs and
 
 This is an early version; Mac setup uses Terminal.
 
-Reading progress syncs both ways through your Mac. New web positions take priority and update Apple Books automatically while your Mac is awake and online; Books may open in the background. Later reading in Apple Books syncs back. Offline phone progress waits until you reconnect.
+Reading progress syncs both ways through your Mac. New web positions take priority and are sent to Apple Books automatically while your Mac is awake and online; Books may open in the background. The reader distinguishes a sent position from one confirmed by Apple Books. Later reading in Apple Books syncs back. Offline phone progress waits until you reconnect.
 
 ## Set up
 

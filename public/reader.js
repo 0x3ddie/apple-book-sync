@@ -527,7 +527,8 @@ function syncMessage(detail = state.detail) {
   if (!state.bridgeOnline) return "Your position stays on this device until you’re online.";
   if (window.ReaderAccount.current?.mode !== "cloud") return "Your position is saved in this reader.";
   if (detail?.syncState === "synced") return "Your position is synced with Apple Books.";
-  if (["pending", "conflict"].includes(detail?.syncState)) return "Your Mac will update Apple Books automatically when it’s online.";
+  if (detail?.syncState === "sent") return "Your Mac sent this position to Apple Books.";
+  if (["pending", "conflict"].includes(detail?.syncState)) return "Your Mac will send this position to Apple Books automatically when it’s online.";
   return "Your progress saves automatically.";
 }
 
@@ -555,8 +556,13 @@ function watchAppleSync() {
       state.bridgeOnline = true;
       state.detail = { ...state.detail, applePosition: fresh.applePosition, webPosition: fresh.webPosition,
         syncState: fresh.syncState, resume: fresh.resume };
-      if (["synced", "apple"].includes(fresh.syncState)) {
-        status("Synced with Apple Books", "Your Mac confirmed your reading position.");
+      if (fresh.syncState === "apple") {
+        status("Apple Books progress updated", "Your next session will resume from Apple Books.");
+        return;
+      }
+      if (["sent", "synced"].includes(fresh.syncState)) {
+        status(fresh.syncState === "sent" ? "Sent to Apple Books" : "Synced with Apple Books",
+          fresh.syncState === "sent" ? "Your Mac sent this position to Apple Books." : "Your Mac confirmed your reading position.");
         return;
       }
       if (--remaining > 0) state.appleSyncTimer = setTimeout(check, 5000);
@@ -622,7 +628,7 @@ async function sendDraft(draft, keepalive = false) {
     }
     if (state.draft?.sequence === draft.sequence && state.draft?.clientId === draft.clientId) {
       state.draft = null;
-      status(result.syncState === "synced" ? "Synced with Apple Books" : "Position saved", syncMessage());
+      status(result.syncState === "synced" ? "Synced with Apple Books" : result.syncState === "sent" ? "Sent to Apple Books" : "Position saved", syncMessage());
       watchAppleSync();
       el("retry-save").hidden = true;
       if (!state.storageWarning) showError("reader-error", "");

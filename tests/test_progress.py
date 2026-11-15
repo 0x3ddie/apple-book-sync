@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from progress import apply_position, _open_url
+from progress import apply_position, deliver_position, _open_url
 
 
 OLD = "epubcfi(/6/12[chapter]!/4/172/1,:0,:1)"
@@ -190,6 +190,56 @@ class ProgressTest(unittest.TestCase):
         self.assertIsNone(apply_position(self.library, "book-one", TARGET,
                                         opener=open_url, cancelled=lambda: True))
         self.assertEqual(len(opens), 1)
+
+
+class DeliveryTest(unittest.TestCase):
+    def test_successful_unverified_delivery_reports_only_post_dispatch_readback(self):
+        library, clock, calls = Library(), Clock(), []
+        observed = position("epubcfi(/6/12!/4/176/1:0)", "new", NEW_STAMP)
+        def open_url(url):
+            calls.append(url)
+            library.current = observed
+            return True
+        result = deliver_position(library, "book-one", TARGET, opener=open_url,
+                                  sleep=clock.sleep, clock=clock)
+        self.assertEqual(result, {"delivered": True, "confirmed": False, "applePosition": observed})
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(clock.now, 10)
+
+    def test_missing_post_dispatch_cfi_is_not_replaced_by_old_baseline(self):
+        library, clock = Library(), Clock()
+        def open_url(_):
+            library.current = None
+            return True
+        self.assertEqual(deliver_position(library, "book-one", TARGET, opener=open_url,
+                                         sleep=clock.sleep, clock=clock),
+                         {"delivered": True, "confirmed": False, "applePosition": None})
+
+    def test_exact_current_target_is_delivered_and_confirmed_without_open(self):
+        library = Library(position(ACTUAL))
+        result = deliver_position(library, "book-one", "epubcfi(/6/12!/4/110/1:0)",
+                                  opener=lambda _: self.fail("Must not open"))
+        self.assertEqual(result, {"delivered": True, "confirmed": True, "applePosition": library.current})
+
+    def test_failed_or_unavailable_delivery_has_no_success_receipt(self):
+        for library in [Library(), Library(readable=False)]:
+            self.assertEqual(deliver_position(library, "book-one", TARGET, opener=lambda _: False),
+                             {"delivered": False, "confirmed": False, "applePosition": None})
+
+    def test_cancelled_after_dispatch_never_returns_success_receipt_or_opens_again(self):
+        library, clock, calls = Library(), Clock(), []
+        cancelled = False
+        def open_url(url):
+            calls.append(url)
+            return True
+        def sleep(seconds):
+            nonlocal cancelled
+            clock.sleep(seconds)
+            cancelled = True
+        result = deliver_position(library, "book-one", TARGET, opener=open_url, sleep=sleep,
+                                  clock=clock, cancelled=lambda: cancelled)
+        self.assertEqual(result, {"delivered": False, "confirmed": False, "applePosition": None})
+        self.assertEqual(len(calls), 1)
 
 
 class NativeOpenTest(unittest.TestCase):

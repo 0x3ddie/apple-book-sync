@@ -403,6 +403,95 @@ const applied = (overrides = {}) => ({
 const acknowledge = (credential, value = applied(), bookId = 'BOOK1') => call(`/api/companion/positions/${bookId}/applied`, {
   bearer: credential, originHeader: null, body: value,
 });
+const delivered = (credential, value = applied(), bookId = 'BOOK1') => call(`/api/companion/positions/${bookId}/delivered`, {
+  bearer: credential, originHeader: null, body: value,
+});
+
+test('successful URL delivery is sent rather than verified, and only later changed Apple CFI takes over', async () => {
+  const alice = await login(); const linked = await pair(alice.cookie); await push(linked.credential);
+  await call('/api/books/BOOK1/position', { cookie: alice.cookie, body: pos() });
+  const read = async () => (await call('/api/books/BOOK1', { cookie: alice.cookie })).body;
+  assert.equal((await delivered(linked.credential)).status, 200);
+  let detail = await read();
+  assert.equal(detail.syncState, 'sent'); assert.equal(detail.webPosition.applied, undefined);
+  assert.deepEqual(detail.resume, { cfi: pos().cfi, source: 'web' });
+  assert.deepEqual((await call('/api/companion/positions', { bearer: linked.credential })).body.positions, []);
+  assert.equal((await delivered(linked.credential)).body.ignored, true);
+  const timestampOnly = { ...applied().applePosition, revision: 'timestamp-only', updatedAt: '2026-11-14T00:02:00Z' };
+  await push(linked.credential, [book({ applePosition: timestampOnly })], 2);
+  assert.equal((await read()).syncState, 'sent');
+  await push(linked.credential, [book()], 3);
+  assert.equal((await read()).syncState, 'sent');
+  const moved = { cfi: 'epubcfi(/6/8!/4/2:0)', revision: 'apple-moved', updatedAt: '2026-11-14T00:03:00Z' };
+  await push(linked.credential, [book({ applePosition: moved, progress: .6 })], 4);
+  detail = await read();
+  assert.equal(detail.syncState, 'apple'); assert.equal(detail.progress, .6);
+  assert.deepEqual(detail.resume, { cfi: moved.cfi, source: 'apple' });
+});
+
+test('a null delivery baseline seeds from the first later Apple snapshot without taking over web resume', async () => {
+  const alice = await login(); const linked = await pair(alice.cookie); await push(linked.credential);
+  await call('/api/books/BOOK1/position', { cookie: alice.cookie, body: pos() });
+  const read = async () => (await call('/api/books/BOOK1', { cookie: alice.cookie })).body;
+  assert.equal((await delivered(linked.credential, applied({ applePosition: null }))).status, 200);
+  assert.equal((await read()).syncState, 'sent');
+  await push(linked.credential, [book({ applePosition: null })], 2);
+  assert.equal((await read()).webPosition.delivered.applePosition, null);
+  await push(linked.credential, [book()], 3);
+  assert.deepEqual((await read()).webPosition.delivered.applePosition, book().applePosition);
+  assert.equal((await read()).syncState, 'sent');
+  assert.deepEqual((await read()).resume, { cfi: pos().cfi, source: 'web' });
+  const moved = { cfi: 'epubcfi(/6/8!/4/2:0)', revision: 'apple-moved', updatedAt: '2026-11-14T00:03:00Z' };
+  await push(linked.credential, [book({ applePosition: moved })], 4);
+  assert.equal((await read()).syncState, 'apple');
+});
+
+test('verified acknowledgement upgrades delivery, and stale delivery cannot downgrade it or clear a newer web revision', async () => {
+  const alice = await login(); const linked = await pair(alice.cookie); await push(linked.credential);
+  const save = (value) => call('/api/books/BOOK1/position', { cookie: alice.cookie, body: value });
+  const read = async () => (await call('/api/books/BOOK1', { cookie: alice.cookie })).body;
+  await save(pos());
+  await delivered(linked.credential, applied({ applePosition: null }));
+  assert.equal((await acknowledge(linked.credential)).status, 200);
+  assert.equal((await read()).syncState, 'synced');
+  assert.equal((await delivered(linked.credential, applied({ applePosition: null }))).body.ignored, true);
+  assert.equal((await read()).syncState, 'synced');
+  const next = await save(pos({ sequence: 2 }));
+  assert.equal(next.body.position.applied, undefined); assert.equal(next.body.position.delivered, undefined);
+  assert.equal((await delivered(linked.credential)).status, 409);
+  assert.equal((await read()).syncState, 'pending');
+});
+
+test('delivery receipts remain scoped to the source Mac and account, including replacement and revocation', async () => {
+  const alice = await login(); const bob = await login('bob@example.test');
+  const first = await pair(alice.cookie); const other = await pair(bob.cookie);
+  await push(first.credential);
+  await call('/api/books/BOOK1/position', { cookie: alice.cookie, body: pos() });
+  assert.equal((await delivered(other.credential)).status, 404);
+  await delivered(first.credential);
+  const replacement = await pair(alice.cookie, 'Replacement Mac');
+  assert.equal((await delivered(replacement.credential)).status, 404);
+  assert.equal((await delivered(first.credential)).status, 401);
+  await push(replacement.credential);
+  assert.equal((await call('/api/books/BOOK1', { cookie: alice.cookie })).body.syncState, 'pending');
+  assert.equal((await call('/api/companion/positions', { bearer: replacement.credential })).body.positions.length, 1);
+  assert.equal((await delivered(replacement.credential)).status, 200);
+  assert.equal((await call('/api/books/BOOK1', { cookie: alice.cookie })).body.syncState, 'sent');
+});
+
+test('delivery receipts require explicit bounded read-back metadata or null, never arbitrary data', async () => {
+  const alice = await login(); const linked = await pair(alice.cookie); await push(linked.credential);
+  await call('/api/books/BOOK1/position', { cookie: alice.cookie, body: pos() });
+  for (const patch of [
+    { revision: 0 }, { cfi: 'file:///private' }, { applePosition: {} },
+    { applePosition: { ...applied().applePosition, updatedAt: null } },
+    { applePosition: { ...applied().applePosition, epub: 'bytes' } }, { ownerId: 'other' },
+  ]) assert.equal((await delivered(linked.credential, applied(patch))).status, 400);
+  assert.equal((await call('/api/companion/positions/BOOK1/delivered', {
+    bearer: linked.credential, originHeader: null, body: { revision: 1, cfi: pos().cfi },
+  })).status, 400);
+  assert.equal((await delivered(linked.credential, applied({ applePosition: null }))).status, 200);
+});
 
 test('pending web position stays authoritative until exact native read-back acknowledgement', async () => {
   const alice = await login(); const linked = await pair(alice.cookie); await push(linked.credential);

@@ -1,6 +1,6 @@
 "use strict";
 
-const CACHE = "books-reader-shell-v14";
+const CACHE = "books-reader-shell-v15";
 const SHELL = ["/", "/styles.css", "/account.js", "/reader.js", "/transfer.js", "/covers.js", "/offline.js", "/vendor/epub.js", "/vendor/jszip.min.js"];
 
 self.addEventListener("install", (event) => {
