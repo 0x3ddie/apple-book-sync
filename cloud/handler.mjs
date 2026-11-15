@@ -57,12 +57,17 @@ export function createHandler({ store, auth, origin }) {
           if (!name) throw new HttpError(400, 'Choose a name for this Mac.');
           return reply(200, await store.startPairing(name, clientIP));
         }
-        fields(body, nativePairing[1] === 'poll' ? ['secret'] : ['secret', 'accountId', 'approve'], 'pairing');
+        fields(body, nativePairing[1] === 'poll' ? ['secret'] : ['secret', 'accountId', 'approve', 'confirmation'], 'pairing');
         const secret = string(body.secret, 48, 'pairing secret', { pattern: /^pair_[A-Za-z0-9_-]{43}$/ });
         if (nativePairing[1] === 'poll') return reply(200, await store.pollPairing(secret));
         const accountId = identifier(body.accountId, 'account identifier');
         if (typeof body.approve !== 'boolean') throw new HttpError(400, 'Confirm or reject this account on your Mac.');
-        return reply(200, await store.completePairing(secret, accountId, body.approve));
+        if (!body.approve && body.confirmation !== undefined) throw new HttpError(400, 'A rejected pairing has no confirmation code.');
+        if (body.approve && body.confirmation === undefined) {
+          throw new HttpError(400, 'Update the Mac companion (git pull), then pair again to enter the code shown on your phone.', { code: 'COMPANION_UPDATE_REQUIRED' });
+        }
+        const confirmation = body.approve ? string(body.confirmation, 6, 'confirmation code', { pattern: /^\d{6}$/ }) : null;
+        return reply(200, await store.completePairing(secret, accountId, body.approve, confirmation));
       }
 
       if (path.startsWith('/api/companion/')) {

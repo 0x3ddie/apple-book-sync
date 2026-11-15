@@ -1,7 +1,30 @@
-import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
 import { HttpError } from './validation.mjs';
 
 const hash = (value) => createHash('sha256').update(value).digest('hex');
+export const MAX_LIBRARY_BOOKS = 10_000;
+export const MAX_LIBRARY_BYTES = 64 * 1024 * 1024;
+const MAX_CONFIRMATION_FAILURES = 3;
+// Shown only to the signed-in reader who claimed the code. The Mac must type
+// it back, proving that the person approving the Mac can see that reader's
+// screen. The pending device ID is random and never sent to the Mac before
+// completion, so a script holding a pairing secret cannot derive it.
+export const pairingConfirmation = (deviceId) =>
+  (parseInt(hash(`books-pairing-confirmation:${deviceId}`).slice(0, 12), 16) % 1_000_000).toString().padStart(6, '0');
+
+export async function rateLimit(pool, key, maximum, windowMs, now, message = 'Too many pairing attempts. Wait a few minutes and try again.') {
+  // This statement commits independently: a rejected attempt must still count.
+  await pool.query('DELETE FROM books_pairing_limits WHERE expires_at<=$1', [now]);
+  const { rows } = await pool.query(`INSERT INTO books_pairing_limits (key_hash,attempts,expires_at)
+    VALUES ($1,1,$2) ON CONFLICT (key_hash) DO UPDATE SET
+    attempts=CASE WHEN books_pairing_limits.expires_at<=$3 THEN 1 ELSE LEAST(books_pairing_limits.attempts+1,$4) END,
+    expires_at=CASE WHEN books_pairing_limits.expires_at<=$3 THEN EXCLUDED.expires_at ELSE books_pairing_limits.expires_at END
+    RETURNING attempts,expires_at`, [hash(key), new Date(now.getTime() + windowMs), now, maximum + 1]);
+  if (rows[0].attempts > maximum) {
+    throw new HttpError(429, message,
+      { retryAfter: Math.max(1, Math.ceil((new Date(rows[0].expires_at).getTime() - now.getTime()) / 1000)) });
+  }
+}
 const iso = (value) => value == null ? null : new Date(value).toISOString();
 const transferReady = (row, now) => !row.revoked_at && row.transfer_seen_at != null
   && new Date(row.transfer_seen_at).getTime() > now.getTime() - 30_000;
@@ -49,8 +72,10 @@ function device(row, now = new Date()) {
 }
 
 export class PostgresStore {
-  constructor(pool, { now = () => new Date(), pairingCode = () => randomInt(1_000_000).toString().padStart(6, '0') } = {}) {
+  constructor(pool, { now = () => new Date(), pairingCode = () => randomInt(1_000_000).toString().padStart(6, '0'),
+    maxBooks = MAX_LIBRARY_BOOKS, maxBytes = MAX_LIBRARY_BYTES } = {}) {
     this.pool = pool; this.now = now; this.pairingCode = pairingCode;
+    this.maxBooks = maxBooks; this.maxBytes = maxBytes;
   }
 
   async transaction(action) {
@@ -111,18 +136,8 @@ export class PostgresStore {
   }
 
   async pairingLimit(key, maximum, windowMs) {
-    const now = this.now();
-    // This statement commits independently: a failed code claim must still count.
-    await this.pool.query('DELETE FROM books_pairing_limits WHERE expires_at<=$1', [now]);
-    const { rows } = await this.pool.query(`INSERT INTO books_pairing_limits (key_hash,attempts,expires_at)
-      VALUES ($1,1,$2) ON CONFLICT (key_hash) DO UPDATE SET
-      attempts=CASE WHEN books_pairing_limits.expires_at<=$3 THEN 1 ELSE LEAST(books_pairing_limits.attempts+1,$4) END,
-      expires_at=CASE WHEN books_pairing_limits.expires_at<=$3 THEN EXCLUDED.expires_at ELSE books_pairing_limits.expires_at END
-      RETURNING attempts,expires_at`, [hash(key), new Date(now.getTime() + windowMs), now, maximum + 1]);
-    if (rows[0].attempts > maximum) {
-      throw new HttpError(429, 'Too many pairing attempts. Wait a few minutes and try again.',
-        { retryAfter: Math.max(1, Math.ceil((new Date(rows[0].expires_at).getTime() - now.getTime()) / 1000)) });
-    }
+    // A failed code claim must still count.
+    await rateLimit(this.pool, key, maximum, windowMs, this.now());
   }
 
   async startPairing(name, ip) {
@@ -149,7 +164,8 @@ export class PostgresStore {
       WHERE code_hash=$2 AND expires_at>$3 AND owner_id IS NULL RETURNING name,device_id,expires_at`,
     [owner, hash(code), this.now()]);
     if (!rows.length) throw new HttpError(400, 'Pairing code is invalid, expired, or already used.');
-    return { name: rows[0].name, deviceId: rows[0].device_id, expiresAt: iso(rows[0].expires_at), status: 'awaiting_mac' };
+    return { name: rows[0].name, deviceId: rows[0].device_id, expiresAt: iso(rows[0].expires_at), status: 'awaiting_mac',
+      confirmation: pairingConfirmation(rows[0].device_id) };
   }
 
   async pollPairing(secret) {
@@ -168,12 +184,25 @@ export class PostgresStore {
     });
   }
 
-  async completePairing(secret, accountId, approve) {
-    return this.transaction(async (client) => {
+  async completePairing(secret, accountId, approve, confirmation = null) {
+    const outcome = await this.transaction(async (client) => {
       const { rows } = await client.query('SELECT * FROM books_device_pairings WHERE secret_hash=$1 FOR UPDATE', [hash(secret)]);
       const row = rows[0];
       if (!row || new Date(row.expires_at) <= this.now()) throw new HttpError(401, 'Pairing expired or was already completed. Start again on your Mac.');
       if (!row.owner_id || row.owner_id !== accountId) throw new HttpError(409, 'The pairing account does not match. Check the account on your Mac again.');
+      if (approve) {
+        const expected = Buffer.from(pairingConfirmation(row.device_id));
+        const entered = Buffer.from(typeof confirmation === 'string' ? confirmation : '');
+        if (entered.length !== expected.length || !timingSafeEqual(entered, expected)) {
+          // The pairing row lock serializes guesses. Count them in this
+          // committed transaction and cancel the pairing after the last one.
+          const failures = (await client.query(`INSERT INTO books_pairing_limits (key_hash,attempts,expires_at)
+            VALUES ($1,1,$2) ON CONFLICT (key_hash) DO UPDATE SET attempts=books_pairing_limits.attempts+1
+            RETURNING attempts`, [hash(`confirm:${hash(secret)}`), row.expires_at])).rows[0].attempts;
+          if (failures >= MAX_CONFIRMATION_FAILURES) await client.query('DELETE FROM books_device_pairings WHERE secret_hash=$1', [hash(secret)]);
+          return { mismatch: true, cancelled: failures >= MAX_CONFIRMATION_FAILURES };
+        }
+      }
       // Serialize replacement with other devices and recheck expiry after waiting for the account lock.
       await client.query('SELECT id FROM "user" WHERE id=$1 FOR UPDATE', [row.owner_id]);
       if (new Date(row.expires_at) <= this.now()) throw new HttpError(401, 'Pairing expired. Start again on your Mac.');
@@ -186,6 +215,9 @@ export class PostgresStore {
         VALUES ($1,$2,$3,$4,$5) RETURNING *`, [row.device_id, row.owner_id, row.name, hash(credential), this.now()]);
       return { device: device(result.rows[0], this.now()), credential };
     });
+    if (outcome.cancelled) throw new HttpError(401, 'Too many incorrect confirmation codes. Start pairing again on your Mac.', { code: 'PAIRING_CANCELLED' });
+    if (outcome.mismatch) throw new HttpError(422, 'The confirmation code does not match. Check the code shown on your phone.', { code: 'CONFIRMATION_MISMATCH' });
+    return outcome;
   }
 
   async authenticateDevice(credential) {
@@ -294,6 +326,13 @@ export class PostgresStore {
           WHERE owner_id=$1 AND book_id=$2 AND position->'delivered'->>'deviceId'=$4
           AND position->'delivered'->'applePosition'='null'::jsonb`,
         [identity.owner, book.id, JSON.stringify(book.applePosition), identity.id]);
+      }
+      // Bound what one account can store. The transaction rolls back this batch.
+      const usage = (await client.query(`SELECT count(*)::int AS books, COALESCE(sum(octet_length(metadata::text)),0)::bigint AS bytes
+        FROM books_library WHERE owner_id=$1`, [identity.owner])).rows[0];
+      if (usage.books > this.maxBooks || Number(usage.bytes) > this.maxBytes) {
+        throw new HttpError(413, `This library exceeds the private sync limit of ${this.maxBooks.toLocaleString('en-US')} books `
+          + `or ${Math.round(this.maxBytes / 1_048_576)} MB of book details, highlights, and notes.`, { code: 'LIBRARY_LIMIT' });
       }
       await client.query('UPDATE books_devices SET snapshot_sequence=$3,last_seen_at=$4 WHERE owner_id=$1 AND id=$2', [identity.owner, identity.id, value.sequence, this.now()]);
       return { ok: true, imported: value.books.length, sequence: value.sequence };

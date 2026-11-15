@@ -1,7 +1,10 @@
 import { betterAuth } from 'better-auth';
+import { APIError } from 'better-auth/api';
 import { magicLink } from 'better-auth/plugins/magic-link';
+import { rateLimit } from './store.mjs';
+import { HttpError } from './validation.mjs';
 
-export function createAuth(config, pool, { sendEmail } = {}) {
+export function createAuth(config, pool, { sendEmail, now = () => new Date() } = {}) {
   const deliver = sendEmail ?? (async ({ email, url }) => {
     const response = await fetch('https://api.resend.com/emails', {
       method: 'POST',
@@ -28,7 +31,18 @@ export function createAuth(config, pool, { sendEmail } = {}) {
     rateLimit: { enabled: true, storage: 'database', window: 60, max: 60 },
     plugins: [magicLink({
       expiresIn: 600, storeToken: 'hashed', rateLimit: { window: 60, max: 3 },
-      sendMagicLink: deliver,
+      // Better Auth limits requests per network. This also limits each inbox,
+      // so the public sign-in form cannot flood someone else's email.
+      sendMagicLink: async (message) => {
+        try {
+          await rateLimit(pool, `magic-link-email:${message.email.trim().toLowerCase()}`, 3, 900_000, now(),
+            'Too many sign-in emails for this address. Wait 15 minutes, then try again.');
+        } catch (error) {
+          if (error instanceof HttpError) throw new APIError('TOO_MANY_REQUESTS', { message: error.message });
+          throw error;
+        }
+        await deliver(message);
+      },
     })],
   });
 }

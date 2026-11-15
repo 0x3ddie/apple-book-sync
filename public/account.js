@@ -128,10 +128,15 @@ window.ReaderAccount = (() => {
     get("pairing-status").textContent = message;
     get("pairing-status").hidden = !message;
   }
+  function showConfirmation(code) {
+    get("pairing-confirmation").textContent = code ? `${code.slice(0, 3)} ${code.slice(3)}` : "";
+    get("pairing-confirmation").hidden = !code;
+  }
   function resetPairing() {
     deviceGeneration++;
     clearTimeout(pairingTimer);
     pairing = null;
+    showConfirmation("");
     get("pairing-code").disabled = false;
     get("link-mac").disabled = false;
     get("reset-pairing").hidden = true;
@@ -191,11 +196,13 @@ window.ReaderAccount = (() => {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code }),
       });
       if (pairing !== attempt) return;
+      if (typeof result.confirmation !== "string" || !/^[0-9]{6}$/.test(result.confirmation)) throw new Error("The server did not return a confirmation code. Reload and try again.");
       attempt.deviceId = result.deviceId;
       attempt.name = result.name;
       attempt.expiresAt = Date.parse(result.expiresAt);
       get("pairing-code").value = "";
-      pairingStatus(`One last step: confirm ${current.user.email} on ${result.name}. Keep the companion open until it says linked.`);
+      pairingStatus(`One last step: on ${result.name}, check that the account shown is ${current.user.email}, then type this confirmation code. Keep the companion open until it says linked.`);
+      showConfirmation(result.confirmation);
       get("reset-pairing").hidden = false;
       checkPairing(attempt);
     } catch (error) {
@@ -235,11 +242,16 @@ window.ReaderAccount = (() => {
     get("sign-out").disabled = true;
     try {
       const prefix = `books-pending:${current.scope}:`;
-      if (Object.keys(localStorage).some((key) => key.startsWith(prefix))) {
-        throw new Error("Some reading positions are still waiting to sync. Reconnect and refresh your library before signing out.");
+      const pending = Object.keys(localStorage).filter((key) => key.startsWith(prefix));
+      // A position the server can never accept must not trap private books on
+      // a shared device. Ask, then discard it with the rest of this account.
+      if (pending.length && !confirm(`${pending.length === 1 ? "A reading position hasn’t" : `${pending.length} reading positions haven’t`} synced yet. Sign out anyway and discard ${pending.length === 1 ? "it" : "them"}?`)) {
+        get("sign-out").disabled = false;
+        return;
       }
       await request("/api/auth/sign-out", { method: "POST", headers: {"Content-Type":"application/json"}, body: "{}" });
       window.dispatchEvent(new Event("books-account-changing"));
+      for (const key of pending) localStorage.removeItem(key);
       localStorage.removeItem(hintKey);
       localStorage.setItem(revokedKey, JSON.stringify({ scope: current.scope, at: Date.now() }));
       // Another tab may have saved a draft while sign-out was in flight.

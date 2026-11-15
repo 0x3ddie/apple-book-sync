@@ -15,19 +15,25 @@ class Element extends EventTarget {
   focus() {}
   click() { if(!this.disabled)this.dispatchEvent(new Event('click')); }
 }
-async function setup({ claim, listDevices }={}) {
+async function setup({ claim, listDevices, confirm=()=>true, pending=[] }={}) {
   const elements=new Map();
   const get=id=>{if(!elements.has(id))elements.set(id,new Element());return elements.get(id);};
   get('devices-panel').hidden=true;
-  const timers=new Map(),requests=[],data=new Map();let nextTimer=0,reloads=0,refreshes=0,closes=0;
+  const timers=new Map(),requests=[];let nextTimer=0,reloads=0,refreshes=0,closes=0,clears=0;
+  // Stored keys are own enumerable properties, as with the real Storage object.
+  const localStorage={};
+  Object.defineProperties(localStorage,{getItem:{value:key=>Object.hasOwn(localStorage,key)?localStorage[key]:null},
+    setItem:{value:(key,value)=>{localStorage[key]=String(value);}},removeItem:{value:key=>{delete localStorage[key];}}});
+  for(const key of pending)localStorage[key]='{}';
+  const confirms=[];
   const window=new EventTarget();
-  window.OfflineBooks={async closeScope(){closes++;}};
+  window.OfflineBooks={async closeScope(){closes++;},async clearScope(){clears++;}};
   const document={getElementById:get,querySelector:get,createElement:()=>new Element(),body:new Element()};
   get('refresh').addEventListener('click',()=>{refreshes++;});
   const context={
     window,document,Headers,AbortSignal,Event,URL,Date,
     location:{hostname:'reader.example',href:'https://reader.example/',reload(){reloads++;}},
-    localStorage:{getItem:key=>data.get(key)??null,setItem:(key,value)=>data.set(key,value),removeItem:key=>data.delete(key)},
+    localStorage,Object,confirm(message){confirms.push(message);return confirm(message);},
     setTimeout(callback,delay){const id=++nextTimer;timers.set(id,{callback,delay});return id;},
     clearTimeout(id){timers.delete(id);},
     fetch:async(path,options={})=>{
@@ -37,6 +43,7 @@ async function setup({ claim, listDevices }={}) {
       if(path==='/api/session')result={mode:'cloud',user};
       else if(path==='/api/devices/pairing')result=await claim(body);
       else if(path==='/api/devices')result={devices:await(listDevices?.()??[])};
+      else if(path==='/api/auth/sign-out')result={success:true};
       else throw Error(`Unexpected request: ${path}`);
       const status=result.httpStatus??200;
       return {ok:status>=200&&status<300,status,async json(){return result.body??result;}};
@@ -45,14 +52,14 @@ async function setup({ claim, listDevices }={}) {
   vm.runInNewContext(source,context);
   await window.ReaderAccount.ready;
   return {
-    window,get,requests,timers,document,
+    window,get,requests,timers,document,localStorage,confirms,get clears(){return clears;},
     get reloads(){return reloads;},get refreshes(){return refreshes;},get closes(){return closes;},
     async open(){get('manage-devices').click();await flush();},
     async submit(code){get('pairing-code').value=code;get('pairing-code').dispatchEvent(new Event('input'));get('pairing-form').dispatchEvent(new Event('submit',{cancelable:true}));await flush();},
     async tick(){const entry=timers.entries().next().value;assert.ok(entry,'A pairing retry should be scheduled');timers.delete(entry[0]);entry[1].callback();await flush();},
   };
 }
-const pendingResult=()=>({deviceId:'new-mac',name:'QA Mac',expiresAt:new Date(Date.now()+300000).toISOString(),status:'awaiting_mac'});
+const pendingResult=()=>({deviceId:'new-mac',name:'QA Mac',expiresAt:new Date(Date.now()+300000).toISOString(),status:'awaiting_mac',confirmation:'048213'});
 
 test('formatted six-digit code preserves leading zero and waits for matching Mac completion',async()=>{
   let linked=[];
@@ -63,6 +70,9 @@ test('formatted six-digit code preserves leading zero and waits for matching Mac
   assert.deepEqual(sent.body,{code:'012345'});
   assert.equal(sent.account,user.id);
   assert.match(qa.get('pairing-status').textContent,/One last step/);
+  assert.match(qa.get('pairing-status').textContent,/reader@example\.test/);
+  assert.equal(qa.get('pairing-confirmation').textContent,'048 213');
+  assert.equal(qa.get('pairing-confirmation').hidden,false);
   assert.equal(qa.refreshes,0);
   assert.equal(qa.get('pairing-code').disabled,true);
   linked=[{id:'another-mac',name:'Other Mac',lastSeenAt:null,revokedAt:null}];
@@ -72,6 +82,8 @@ test('formatted six-digit code preserves leading zero and waits for matching Mac
   linked=[{id:'new-mac',name:'QA Mac',lastSeenAt:null,revokedAt:null}];
   await qa.tick();
   assert.match(qa.get('pairing-status').textContent,/QA Mac is linked/);
+  assert.equal(qa.get('pairing-confirmation').hidden,true);
+  assert.equal(qa.get('pairing-confirmation').textContent,'');
   assert.equal(qa.refreshes,1);
   assert.equal(qa.get('pairing-code').disabled,false);
   assert.equal(qa.timers.size,0);
@@ -123,4 +135,39 @@ test('closing device panel pauses pending checks and reopening resumes them',asy
   await qa.open();
   assert.equal(qa.requests.length,calls+1);
   assert.equal(qa.timers.size,1);
+});
+
+test('a claim without a confirmation code is not shown as pending',async()=>{
+  const qa=await setup({claim:async()=>{const result=pendingResult();delete result.confirmation;return result;}});
+  await qa.open();await qa.submit('123456');
+  assert.match(qa.get('device-error').textContent,/confirmation code/);
+  assert.equal(qa.get('pairing-confirmation').hidden!==false,true);
+  assert.equal(qa.get('pairing-code').disabled,false);
+  assert.equal(qa.timers.size,0);
+});
+
+test('unsynced positions ask before sign-out instead of blocking it forever',async()=>{
+  const prefix=`books-pending:account:${user.id}:`;
+  let allow=false;
+  const qa=await setup({confirm:()=>allow,pending:[`${prefix}BOOK1`,`${prefix}BOOK2`,'books-pending:account:someone-else:BOOK3']});
+  qa.get('sign-out').click();await flush();
+  assert.equal(qa.confirms.length,1);
+  assert.match(qa.confirms[0],/2 reading positions haven’t synced/);
+  assert.ok(!qa.requests.some(item=>item.path==='/api/auth/sign-out'));
+  assert.equal(qa.get('sign-out').disabled,false);
+  assert.equal(qa.reloads,0);
+  allow=true;
+  qa.get('sign-out').click();await flush();
+  assert.ok(qa.requests.some(item=>item.path==='/api/auth/sign-out'));
+  assert.equal(qa.localStorage.getItem(`${prefix}BOOK1`),null);
+  assert.equal(qa.localStorage.getItem(`${prefix}BOOK2`),null);
+  assert.equal(qa.localStorage.getItem('books-pending:account:someone-else:BOOK3'),'{}');
+  assert.equal(qa.clears,1);assert.equal(qa.reloads,1);
+});
+
+test('sign-out without unsynced positions does not ask',async()=>{
+  const qa=await setup();
+  qa.get('sign-out').click();await flush();
+  assert.equal(qa.confirms.length,0);
+  assert.equal(qa.clears,1);assert.equal(qa.reloads,1);
 });

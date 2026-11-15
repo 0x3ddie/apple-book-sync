@@ -30,7 +30,9 @@ Keep Terminal open. It shows a six-digit code, valid for five minutes.
 
 Open [the web app](https://apple-book-sync.vercel.app) in Chrome on your phone and sign in using the email link. Open **Linked Macs**, enter the six-digit code, and tap **Link Mac**.
 
-Back on your Mac, check that the displayed email is yours and type **yes**. Pairing is saved; you won’t need a new code each time. Linking another Mac replaces the previous one.
+Your phone then shows a confirmation code. Back on your Mac, check that the displayed email is yours and type that code. Pairing is saved; you won’t need a new code each time. Linking another Mac replaces the previous one.
+
+If you cloned the companion before this step existed, run `git pull` first.
 
 ### 3. Enable background sync
 

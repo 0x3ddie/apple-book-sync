@@ -6,7 +6,7 @@ import { PGlite } from '@electric-sql/pglite';
 import { getMigrations } from 'better-auth/db/migration';
 import { createAuth } from '../auth.mjs';
 import { createCloudHandler, createHandler } from '../handler.mjs';
-import { PostgresStore } from '../store.mjs';
+import { PostgresStore, pairingConfirmation } from '../store.mjs';
 
 const origin = 'https://reader.example';
 let database, pool, auth, handle, time;
@@ -75,8 +75,8 @@ async function login(email = 'alice@example.test', ip = '203.0.113.7') {
 
 const startPairing = (name = 'Test Mac', options = {}) => call('/api/devices/pairing/start', { originHeader: null, body: { name }, ...options });
 const pollPairing = (secret, options = {}) => call('/api/devices/pairing/poll', { originHeader: null, body: { secret }, ...options });
-const completePairing = (secret, accountId, approve = true, options = {}) => call('/api/devices/pairing/complete', {
-  originHeader: null, body: { secret, accountId, approve }, ...options,
+const completePairing = (secret, accountId, approve = true, { confirmation = '000000', ...options } = {}) => call('/api/devices/pairing/complete', {
+  originHeader: null, body: { secret, accountId, approve, ...(approve === true ? { confirmation } : {}) }, ...options,
 });
 const claimPairing = (cookie, code, options = {}) => call('/api/devices/pairing', { cookie, body: { code }, ...options });
 
@@ -87,7 +87,7 @@ async function pair(cookie, name = 'Test Mac') {
   assert.equal(claimed.status, 200, JSON.stringify(claimed.body));
   const pending = await pollPairing(created.body.secret);
   assert.equal(pending.body.status, 'claimed');
-  const completed = await completePairing(created.body.secret, pending.body.account.id);
+  const completed = await completePairing(created.body.secret, pending.body.account.id, true, { confirmation: claimed.body.confirmation });
   assert.equal(completed.status, 200, JSON.stringify(completed.body));
   assert.equal(completed.body.device.id, claimed.body.deviceId);
   return { ...completed.body, secret: created.body.secret, code: created.body.code };
@@ -110,7 +110,7 @@ async function push(credential, books = [book()], sequence = 1) {
 before(async () => {
   database = new PGlite();
   pool = postgresPool(database);
-  auth = createAuth({ origin, secret: randomBytes(32).toString('hex') }, pool, { sendEmail: async (message) => { emails.push(message); } });
+  auth = createAuth({ origin, secret: randomBytes(32).toString('hex') }, pool, { sendEmail: async (message) => { emails.push(message); }, now: () => new Date(time) });
   const migration = await getMigrations(auth.options);
   await migration.runMigrations();
   await database.exec(await readFile(new URL('../schema.sql', import.meta.url), 'utf8'));
@@ -200,7 +200,8 @@ test('six-digit Mac pairing requires phone claim and matching Mac confirmation; 
   assert.equal((await completePairing(created.body.secret, alice.session.user.id)).status, 409);
   const claimed = await claimPairing(alice.cookie, created.body.code);
   assert.deepEqual(claimed.body, { name: 'Alice Mac', deviceId: storedPairing.device_id,
-    expiresAt: created.body.expiresAt, status: 'awaiting_mac' });
+    expiresAt: created.body.expiresAt, status: 'awaiting_mac', confirmation: pairingConfirmation(storedPairing.device_id) });
+  assert.match(claimed.body.confirmation, /^\d{6}$/);
   assert.equal((await call('/api/devices', { cookie: alice.cookie })).body.devices.length, 0);
   assert.equal((await pollPairing(created.body.secret)).status, 429);
   time += 3000;
@@ -208,7 +209,9 @@ test('six-digit Mac pairing requires phone claim and matching Mac confirmation; 
   assert.deepEqual(ready.body, { status: 'claimed', expiresAt: created.body.expiresAt,
     account: { id: alice.session.user.id, email: alice.session.user.email } });
   assert.equal((await completePairing(created.body.secret, 'different-account')).status, 409);
-  const attempts = await Promise.all([completePairing(created.body.secret, alice.session.user.id), completePairing(created.body.secret, alice.session.user.id)]);
+  assert.ok(!JSON.stringify(ready.body).includes(claimed.body.confirmation));
+  const confirmed = { confirmation: claimed.body.confirmation };
+  const attempts = await Promise.all([completePairing(created.body.secret, alice.session.user.id, true, confirmed), completePairing(created.body.secret, alice.session.user.id, true, confirmed)]);
   assert.deepEqual(attempts.map((result) => result.status).sort(), [200, 401]);
   const linked = attempts.find((result) => result.status === 200).body;
   assert.equal(linked.device.id, claimed.body.deviceId);
@@ -242,7 +245,8 @@ test('pairing expires after five minutes without changing existing devices', asy
 test('completion rechecks expiry after waiting for the account lock', async () => {
   const alice = await login(), linked = await pair(alice.cookie);
   const created = await startPairing('Delayed confirmation');
-  assert.equal((await claimPairing(alice.cookie, created.body.code)).status, 200);
+  const claim = await claimPairing(alice.cookie, created.body.code);
+  assert.equal(claim.status, 200);
   const delayedPool = {
     async connect() {
       const client = await pool.connect();
@@ -257,7 +261,7 @@ test('completion rechecks expiry after waiting for the account lock', async () =
     },
   };
   const store = new PostgresStore(delayedPool, { now: () => new Date(time) });
-  await assert.rejects(store.completePairing(created.body.secret, alice.session.user.id, true), (error) => error.status === 401);
+  await assert.rejects(store.completePairing(created.body.secret, alice.session.user.id, true, claim.body.confirmation), (error) => error.status === 401);
   assert.equal((await push(linked.credential)).status, 200);
   assert.equal((await pool.query('SELECT count(*)::int AS count FROM books_devices')).rows[0].count, 1);
 });
@@ -275,6 +279,97 @@ test('a code can be claimed once and rejecting the shown account cannot replace 
   assert.equal((await completePairing(created.body.secret, owner.session.user.id)).status, 401);
   assert.equal((await push(linked.credential)).status, 200);
   assert.equal((await pool.query('SELECT count(*)::int AS count FROM books_devices')).rows[0].count, 1);
+});
+
+test('a mistyped or phished code cannot link a stranger’s Mac without the phone’s confirmation code', async () => {
+  const alice = await login(), linked = await pair(alice.cookie, 'Alice Mac');
+  // A stranger holds a live code. Alice enters it by mistake.
+  const stranger = await startPairing('Alice’s MacBook', { ip: '198.51.100.9' });
+  const claimed = await claimPairing(alice.cookie, stranger.body.code);
+  assert.equal(claimed.status, 200);
+  const polled = await pollPairing(stranger.body.secret, { ip: '198.51.100.9' });
+  assert.equal(polled.body.status, 'claimed');
+  assert.ok(!JSON.stringify(polled.body).includes(claimed.body.confirmation));
+  assert.ok(!JSON.stringify(polled.body).includes(claimed.body.deviceId));
+  const guesses = ['111111', '222222', '333333'].filter((code) => code !== claimed.body.confirmation).slice(0, 2);
+  for (const confirmation of guesses) {
+    const guess = await completePairing(stranger.body.secret, alice.session.user.id, true, { confirmation, ip: '198.51.100.9' });
+    assert.equal(guess.status, 422);
+    assert.equal(guess.body.code, 'CONFIRMATION_MISMATCH');
+    assert.ok(!('credential' in guess.body));
+  }
+  const last = await completePairing(stranger.body.secret, alice.session.user.id, true, {
+    confirmation: claimed.body.confirmation === '444444' ? '555555' : '444444', ip: '198.51.100.9' });
+  assert.equal(last.status, 401);
+  assert.equal(last.body.code, 'PAIRING_CANCELLED');
+  // The pairing is gone, so even the right code can no longer finish it.
+  assert.equal((await completePairing(stranger.body.secret, alice.session.user.id, true, { confirmation: claimed.body.confirmation })).status, 401);
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM books_device_pairings')).rows[0].count, 0);
+  assert.equal((await push(linked.credential)).status, 200);
+  const devices = (await call('/api/devices', { cookie: alice.cookie })).body.devices;
+  assert.deepEqual(devices.map((device) => [device.name, !!device.revokedAt]), [['Alice Mac', false]]);
+});
+
+test('a confirmation typo can be corrected, and codes are tied to their own pairing', async () => {
+  const alice = await login();
+  const first = await startPairing('First Mac'), second = await startPairing('Second Mac');
+  const firstClaim = await claimPairing(alice.cookie, first.body.code);
+  const secondClaim = await claimPairing(alice.cookie, second.body.code);
+  assert.notEqual(firstClaim.body.confirmation, secondClaim.body.confirmation);
+  assert.equal((await completePairing(first.body.secret, alice.session.user.id, true, { confirmation: secondClaim.body.confirmation })).status, 422);
+  const linked = await completePairing(first.body.secret, alice.session.user.id, true, { confirmation: firstClaim.body.confirmation });
+  assert.equal(linked.status, 200);
+  assert.equal(linked.body.device.name, 'First Mac');
+});
+
+test('approval needs a six-digit confirmation; older companions are told to update', async () => {
+  const alice = await login();
+  const created = await startPairing();
+  await claimPairing(alice.cookie, created.body.code);
+  const old = await call('/api/devices/pairing/complete', { originHeader: null,
+    body: { secret: created.body.secret, accountId: alice.session.user.id, approve: true } });
+  assert.equal(old.status, 400);
+  assert.equal(old.body.code, 'COMPANION_UPDATE_REQUIRED');
+  for (const confirmation of ['12345', '1234567', '12 345', 123456, null]) {
+    assert.equal((await completePairing(created.body.secret, alice.session.user.id, true, { confirmation })).status, 400);
+  }
+  assert.equal((await call('/api/devices/pairing/complete', { originHeader: null,
+    body: { secret: created.body.secret, accountId: alice.session.user.id, approve: false, confirmation: '123456' } })).status, 400);
+  // Malformed input never counted as a guess.
+  const claimedConfirmation = pairingConfirmation((await pool.query('SELECT device_id FROM books_device_pairings')).rows[0].device_id);
+  assert.equal((await completePairing(created.body.secret, alice.session.user.id, true, { confirmation: claimedConfirmation })).status, 200);
+});
+
+test('sign-in emails are limited per address across networks and recover after the window', async () => {
+  const send = (email, ip) => call('/api/auth/sign-in/magic-link', { body: { email, callbackURL: '/' }, ip });
+  for (let index = 0; index < 3; index++) assert.equal((await send('target@example.test', `198.51.100.${index + 1}`)).status, 200);
+  const limited = await send('Target@Example.test', '198.51.100.50');
+  assert.equal(limited.status, 429);
+  assert.match(limited.body.message, /Too many sign-in emails/);
+  assert.equal(emails.filter((message) => message.email.toLowerCase() === 'target@example.test').length, 3);
+  assert.equal((await send('someone-else@example.test', '198.51.100.51')).status, 200);
+  time += 900_000;
+  assert.equal((await send('target@example.test', '198.51.100.52')).status, 200);
+});
+
+test('one account cannot grow its synced library past the storage limits', async () => {
+  const alice = await login(), mac = await pair(alice.cookie);
+  const limited = createHandler({ auth, origin, store: new PostgresStore(pool, { now: () => new Date(time), maxBooks: 2, maxBytes: 8192 }) });
+  const send = async (books, sequence) => {
+    const response = await limited(request('/api/companion/snapshot', { bearer: mac.credential, originHeader: null, body: { sequence, books } }));
+    return { status: response.status, body: await response.json() };
+  };
+  assert.equal((await send([book({ id: 'A' }), book({ id: 'B' })], 1)).status, 200);
+  const tooMany = await send([book({ id: 'C' })], 2);
+  assert.equal(tooMany.status, 413);
+  assert.equal(tooMany.body.code, 'LIBRARY_LIMIT');
+  assert.equal((await send([book({ id: 'A', title: 'Updated' })], 3)).status, 200);
+  const tooLarge = await send([book({ id: 'B', annotations: [{ id: 'n', type: 'highlight', cfi: 'epubcfi(/6/2!/4/2:0)', text: '', note: 'x'.repeat(9000), color: 'yellow' }] })], 4);
+  assert.equal(tooLarge.status, 413);
+  const library = (await call('/api/library', { cookie: alice.cookie })).body.books;
+  assert.deepEqual(library.map((item) => [item.id, item.title]).sort(), [['A', 'Updated'], ['B', 'Private book']]);
+  // A rejected batch does not consume the sequence.
+  assert.equal((await send([book({ id: 'B', title: 'Retried' })], 4)).status, 200);
 });
 
 test('pairing routes enforce origins, account binding, strict payloads, and secret-only polling', async () => {
@@ -657,7 +752,7 @@ test('linking a replacement Mac keeps the old writer until the Mac confirms its 
   const claimed = await claimPairing(alice.cookie, replacement.body.code);
   assert.equal(claimed.status, 200);
   assert.equal((await push(first.credential, [book()], 2)).status, 200);
-  const finished = await completePairing(replacement.body.secret, alice.session.user.id);
+  const finished = await completePairing(replacement.body.secret, alice.session.user.id, true, { confirmation: claimed.body.confirmation });
   assert.equal(finished.status, 200);
   assert.equal((await push(first.credential, [book({ title: 'Old Mac' })], 3)).status, 401);
   assert.equal((await push(finished.body.credential, [book({ title: 'New Mac' })])).status, 200);

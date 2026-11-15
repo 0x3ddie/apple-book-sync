@@ -29,6 +29,7 @@ MAX_BODY = 1024 * 1024
 MAX_BOOKS = 200
 MAX_SEQUENCE = 9007199254740991
 PAIRING_SECONDS = 5 * 60
+PAIRING_CONFIRMATION_PROMPTS = 5
 
 
 class CompanionError(Exception):
@@ -298,18 +299,38 @@ def pair(server, name, allow_local_http=False, path=CONFIG):
             account_id, email = pairing_account(status.get("account"))
             break
     print(f"\nAccount requesting this Mac: {email}", flush=True)
-    print("Confirm this is your account before sharing your Books library.", flush=True)
-    try:
-        approve = input("Link this Mac to that account? Type yes to approve [yes/No]: ").strip().lower() == "yes"
-    except EOFError:
-        approve = False
-    if time.monotonic() >= deadline:
-        raise CompanionError("The pairing code expired before confirmation. Run the pair command again.")
-    if path.exists() or path.is_symlink():
-        raise CompanionError("This Mac was paired while waiting. Its existing pairing was kept.")
-    result = client.request("POST", "/api/devices/pairing/complete",
-                            {"secret": secret, "accountId": account_id, "approve": approve})
-    if not approve:
+    print("If this is your account, type the six-digit confirmation code shown on your phone.", flush=True)
+    print("If you don't recognize this account, press Return to cancel.", flush=True)
+    result = None
+    for _ in range(PAIRING_CONFIRMATION_PROMPTS):
+        try:
+            entered = re.sub(r"\s", "", input("Confirmation code from your phone: "))
+        except EOFError:
+            entered = ""
+        if time.monotonic() >= deadline:
+            raise CompanionError("The pairing code expired before confirmation. Run the pair command again.")
+        if path.exists() or path.is_symlink():
+            raise CompanionError("This Mac was paired while waiting. Its existing pairing was kept.")
+        if not entered:
+            break
+        if not re.fullmatch(r"[0-9]{6}", entered):
+            print("Enter the six digits shown on your phone, or press Return to cancel.", flush=True)
+            continue
+        try:
+            result = client.request("POST", "/api/devices/pairing/complete",
+                                    {"secret": secret, "accountId": account_id, "approve": True, "confirmation": entered})
+            break
+        except CompanionError as error:
+            if error.status == 422:
+                print("That code doesn't match your phone. Check it and try again.", flush=True)
+                continue
+            if error.status == 401:
+                raise CompanionError("Pairing was cancelled after too many incorrect codes, or it expired. "
+                                     "Run the pair command again.") from None
+            raise
+    if result is None:
+        result = client.request("POST", "/api/devices/pairing/complete",
+                                {"secret": secret, "accountId": account_id, "approve": False})
         if result.get("ok") is not True:
             raise CompanionError("The sync service did not confirm cancellation. No local pairing was saved.")
         print("Pairing cancelled. No library data was sent.", flush=True)

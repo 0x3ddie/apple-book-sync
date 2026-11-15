@@ -241,7 +241,7 @@ class PairingTest(unittest.TestCase):
                         "account": {"id": "account-one", "email": "reader@example.com"}}
         self.complete = {"device": {"id": "new-device"}, "credential": self.credential}
         self.request = self.enterContext(patch("companion.SyncClient.request"))
-        self.confirm = self.enterContext(patch("builtins.input", return_value="yes"))
+        self.confirm = self.enterContext(patch("builtins.input", return_value="482913"))
         self.enterContext(patch("companion.sys.stdin.isatty", return_value=True))
         self.enterContext(patch("companion.time.time", side_effect=lambda: self.wall_time + self.elapsed))
         self.enterContext(patch("companion.time.monotonic", side_effect=lambda: self.elapsed))
@@ -267,7 +267,7 @@ class PairingTest(unittest.TestCase):
             self.assertFalse(self.path.exists())
             self.assertNotIn("/api/devices/pairing/complete", [call.args[1] for call in self.request.call_args_list])
             self.assertIn("reader@example.com", self.output.getvalue())
-            return " YES "
+            return " 482 913 "
 
         self.confirm.side_effect = confirm
         with patch("companion.BooksLibrary") as library, patch("companion.sync") as metadata_sync:
@@ -278,7 +278,8 @@ class PairingTest(unittest.TestCase):
         self.assertEqual([call.args for call in self.request.call_args_list], [
             ("POST", "/api/devices/pairing/start", {"name": "Test Mac"}),
             *[("POST", "/api/devices/pairing/poll", {"secret": self.secret}) for _ in range(3)],
-            ("POST", "/api/devices/pairing/complete", {"secret": self.secret, "accountId": "account-one", "approve": True}),
+            ("POST", "/api/devices/pairing/complete",
+             {"secret": self.secret, "accountId": "account-one", "approve": True, "confirmation": "482913"}),
         ])
         config = read_config(self.path)
         self.assertEqual(config["deviceId"], "new-device")
@@ -290,14 +291,34 @@ class PairingTest(unittest.TestCase):
         self.assertNotIn(self.credential, self.output.getvalue())
 
     def test_default_or_explicit_rejection_consumes_code_without_saving_credentials(self):
-        for answer in ("", "no", "y"):
+        for answer in ("", "  ", "no", "yes", "12345"):
             with self.subTest(answer=answer):
+                self.request.reset_mock()
                 self.request.side_effect = [self.start, self.claimed, {"ok": True}]
                 self.confirm.return_value = answer
                 self.assertFalse(self.run_pair())
                 self.request.assert_called_with("POST", "/api/devices/pairing/complete",
                                                 {"secret": self.secret, "accountId": "account-one", "approve": False})
+                self.assertFalse(any(call.args[2].get("approve") is True for call in self.request.call_args_list
+                                     if call.args[1].endswith("/complete")))
                 self.assertFalse(self.path.exists())
+
+    def test_wrong_confirmation_can_be_retyped_before_credentials_are_saved(self):
+        self.request.side_effect = [self.start, self.claimed, CompanionError("Mismatch", status=422), self.complete]
+        self.confirm.side_effect = ["111111", "482913"]
+        self.assertTrue(self.run_pair())
+        completions = [call.args[2] for call in self.request.call_args_list if call.args[1].endswith("/complete")]
+        self.assertEqual([item["confirmation"] for item in completions], ["111111", "482913"])
+        self.assertIn("doesn't match", self.output.getvalue())
+        self.assertEqual(read_config(self.path)["credential"], self.credential)
+
+    def test_server_cancelling_after_wrong_codes_saves_nothing(self):
+        self.request.side_effect = [self.start, self.claimed, CompanionError("Mismatch", status=422),
+                                    CompanionError("Cancelled", status=401)]
+        self.confirm.side_effect = ["111111", "222222"]
+        with self.assertRaisesRegex(CompanionError, "too many incorrect codes"):
+            self.run_pair()
+        self.assertFalse(self.path.exists())
 
     def test_pending_pairing_expires_without_confirmation_or_completion(self):
         self.request.side_effect = lambda method, endpoint, payload: self.start if endpoint.endswith("/start") else self.pending
