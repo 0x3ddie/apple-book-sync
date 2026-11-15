@@ -109,19 +109,17 @@ class LibraryTest(unittest.TestCase):
         self.assertEqual(saved["position"]["cfi"], payload["cfi"])
         self.assertEqual(self.api.book("one")["resume"]["source"], "web")
 
-    def test_changed_apple_baseline_prompts_instead_of_overwriting(self):
+    def test_new_web_progress_wins_a_changed_apple_baseline(self):
         payload = self.payload()
         self.api.save_position("one", payload)
         self.change_apple_position()
         current = self.api.book("one")
-        self.assertEqual(current["syncState"], "conflict")
+        self.assertEqual(current["syncState"], "pending")
         self.assertEqual(current["resume"]["cfi"], payload["cfi"])
         payload["sequence"] = 2
-        with self.assertRaises(ConflictError):
-            self.api.save_position("one", payload)
-        payload["appleRevision"] = current["applePosition"]["revision"]
         resolved = self.api.save_position("one", payload)
         self.assertEqual(resolved["syncState"], "pending")
+        self.assertEqual(resolved["position"]["appleRevision"], current["applePosition"]["revision"])
         self.assertEqual(self.api.book("one")["syncState"], "pending")
 
     def test_invalid_input_and_unknown_book_do_not_write(self):
@@ -184,8 +182,8 @@ class LibraryTest(unittest.TestCase):
             self.change_apple_position()
             payload["sequence"] = 2
             status, body = request("POST", "/api/books/one/position", payload)
-            self.assertEqual(status, 409)
-            self.assertEqual(body["book"]["syncState"], "conflict")
+            self.assertEqual(status, 200)
+            self.assertEqual(body["syncState"], "pending")
         finally:
             server.shutdown()
             server.server_close()

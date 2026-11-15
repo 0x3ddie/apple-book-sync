@@ -191,7 +191,7 @@ class BooksLibrary:
     @staticmethod
     def sync_state(apple, web):
         if web:
-            return "conflict" if web["appleRevision"] != (apple or {}).get("revision") else "pending"
+            return "pending"
         return "apple" if apple else "empty"
 
     def summary(self, raw, annotations):
@@ -270,8 +270,6 @@ class BooksLibrary:
             if previous and previous["clientId"] == client and sequence <= previous["sequence"]:
                 return {"ok": True, "position": previous, "syncState": book["syncState"], "ignored": True}
             apple_revision = (book["applePosition"] or {}).get("revision")
-            if payload.get("appleRevision") != apple_revision:
-                raise ConflictError("Apple Books has a newer position. Choose where to continue.", book)
             revision = previous["revision"] if previous else 0
             if (not previous or previous["clientId"] != client) and base_revision != revision:
                 raise ConflictError("Another reader saved a newer position. Choose where to continue.", book)

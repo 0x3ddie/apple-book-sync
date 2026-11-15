@@ -5,8 +5,14 @@ const hash = (value) => createHash('sha256').update(value).digest('hex');
 const iso = (value) => value == null ? null : new Date(value).toISOString();
 const transferReady = (row, now) => !row.revoked_at && row.transfer_seen_at != null
   && new Date(row.transfer_seen_at).getTime() > now.getTime() - 30_000;
-export function syncState(apple, web) {
-  return web ? (web.appleRevision === (apple?.revision ?? null) ? 'pending' : 'conflict') : apple ? 'apple' : 'empty';
+export function syncState(apple, web, sourceDeviceId) {
+  if (!web) return apple ? 'apple' : 'empty';
+  const applied = web.applied;
+  if (!applied || sourceDeviceId && applied.deviceId !== sourceDeviceId) return 'pending';
+  // An older snapshot can arrive after acknowledgement. Only subsequent Apple
+  // reading takes over once this exact web revision has been applied.
+  return apple && apple.revision !== applied.applePosition.revision
+    && Date.parse(apple.updatedAt) > Date.parse(applied.applePosition.updatedAt) ? 'apple' : 'synced';
 }
 
 function detail(row) {
@@ -14,17 +20,19 @@ function detail(row) {
   const book = row.metadata;
   const web = row.web_position ?? null;
   const apple = book.applePosition;
+  const state = syncState(apple, web, row.source_device_id);
+  const resume = state === 'apple' ? apple : web ?? apple;
   return {
     id: row.book_id, title: book.title, author: book.author,
-    progress: web?.percentage ?? book.progress,
+    progress: state === 'apple' ? book.progress : web?.percentage ?? book.progress,
     lastReadAt: [book.lastReadAt, web?.savedAt].filter(Boolean).sort().at(-1) ?? null,
     readable: false, availableOnMac: book.availableOnMac,
     unavailableReason: 'Save this book on this device before reading. EPUB files stay on your own devices.',
     coverUrl: null, epubUrl: null,
     appleBooksUrl: `ibooks://assetid/${encodeURIComponent(row.book_id)}`,
     applePosition: apple, webPosition: web,
-    resume: { cfi: web?.cfi ?? apple?.cfi ?? null, source: web ? 'web' : apple ? 'apple' : 'start' },
-    syncState: syncState(apple, web), annotations: book.annotations,
+    resume: { cfi: resume?.cfi ?? null, source: state === 'apple' ? 'apple' : web ? 'web' : apple ? 'apple' : 'start' },
+    syncState: state, annotations: book.annotations,
     importedAt: iso(row.imported_at), sourceDeviceId: row.source_device_id,
   };
 }
@@ -84,15 +92,12 @@ export class PostgresStore {
       if (previous?.clientId === value.clientId && value.sequence <= previous.sequence) {
         return { ok: true, position: previous, syncState: book.syncState, ignored: true };
       }
-      if (value.appleRevision !== (book.applePosition?.revision ?? null)) {
-        throw new HttpError(409, 'Apple Books has a newer position. Choose where to continue.', { book });
-      }
       if ((!previous || previous.clientId !== value.clientId) && value.baseRevision !== (previous?.revision ?? 0)) {
         throw new HttpError(409, 'Another reader saved a newer position. Choose where to continue.', { book });
       }
       const position = {
         cfi: value.cfi, savedAt: this.now().toISOString(), revision: (previous?.revision ?? 0) + 1,
-        clientId: value.clientId, sequence: value.sequence, appleRevision: value.appleRevision,
+        clientId: value.clientId, sequence: value.sequence, appleRevision: book.applePosition?.revision ?? null,
         href: value.href, percentage: value.percentage,
       };
       await client.query(`INSERT INTO books_positions (owner_id, book_id, position) VALUES ($1,$2,$3::jsonb)
@@ -286,10 +291,31 @@ export class PostgresStore {
 
   async positions(identity) {
     // Pulling a pending position does not claim it has been applied in Apple Books.
-    const positions = (await this.rows(identity.owner)).filter((row) => row.web_position).map((row) => ({
+    const { rows } = await this.pool.query(`SELECT b.*,p.position AS web_position FROM books_library b
+      JOIN books_positions p ON p.owner_id=b.owner_id AND p.book_id=b.book_id
+      JOIN books_devices d ON d.owner_id=b.owner_id AND d.id=b.source_device_id
+      WHERE b.owner_id=$1 AND b.source_device_id=$2 AND d.revoked_at IS NULL`, [identity.owner, identity.id]);
+    const positions = rows.filter((row) => syncState(row.metadata.applePosition, row.web_position, row.source_device_id) === 'pending').map((row) => ({
       bookId: row.book_id, position: row.web_position, applePosition: row.metadata.applePosition,
-      syncState: syncState(row.metadata.applePosition, row.web_position),
+      syncState: 'pending',
     }));
     return { positions, refreshedAt: this.now().toISOString() };
+  }
+
+  async acknowledgePosition(identity, bookId, value) {
+    return this.transaction(async (client) => {
+      const device = await client.query('SELECT id FROM books_devices WHERE owner_id=$1 AND id=$2 AND revoked_at IS NULL FOR SHARE', [identity.owner, identity.id]);
+      if (!device.rows.length) throw new HttpError(401, 'Companion has been revoked.');
+      const row = (await this.rows(identity.owner, bookId, client, true))[0];
+      if (!row || row.source_device_id !== identity.id) throw new HttpError(404, 'Book not found on this linked Mac.');
+      const position = row.web_position;
+      if (!position || position.revision !== value.revision || position.cfi !== value.cfi) {
+        throw new HttpError(409, 'A newer web position is waiting. Read the pending position again.');
+      }
+      if (position.applied?.deviceId === identity.id) return { ok: true, ignored: true, revision: position.revision };
+      position.applied = { deviceId: identity.id, at: this.now().toISOString(), applePosition: value.applePosition };
+      await client.query('UPDATE books_positions SET position=$3::jsonb WHERE owner_id=$1 AND book_id=$2', [identity.owner, bookId, JSON.stringify(position)]);
+      return { ok: true, revision: position.revision };
+    });
   }
 }

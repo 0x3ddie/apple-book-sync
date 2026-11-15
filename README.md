@@ -6,7 +6,9 @@ A companion on your Mac connects your library to your private account. EPUBs and
 
 **[Open the web app →](https://apple-book-sync.vercel.app)**
 
-This is an early version. Mac setup uses Terminal, and reading progress from the web app does **not yet update Apple Books automatically**.
+This is an early version; Mac setup uses Terminal.
+
+Reading progress syncs both ways through your Mac. New web positions take priority and update Apple Books automatically while your Mac is awake and online; Books may open in the background. Later reading in Apple Books syncs back. Offline phone progress waits until you reconnect.
 
 ## Set up
 

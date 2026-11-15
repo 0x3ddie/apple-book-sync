@@ -18,7 +18,7 @@ LABEL = "xyz.eddiechen.books-companion"
 PERMISSIONS_LABEL = f"{LABEL}.permissions"
 ROOT = Path(__file__).resolve().parent
 LAUNCHCTL = "/bin/launchctl"
-RUNTIME_MODULES = ("companion.py", "transfer.py", "library.py", "prepare.py", "background.py", "mac_permissions.py", "covers.py")
+RUNTIME_MODULES = ("companion.py", "transfer.py", "library.py", "prepare.py", "background.py", "mac_permissions.py", "covers.py", "progress.py", "position_sync.py")
 
 
 def service_definition(root):

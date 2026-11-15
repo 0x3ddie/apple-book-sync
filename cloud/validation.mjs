@@ -113,6 +113,19 @@ function applePosition(value) {
   return { cfi: cfi(value.cfi), updatedAt: timestamp(value.updatedAt), revision: string(value.revision, 200, 'Apple revision') };
 }
 
+export function appliedPosition(value) {
+  fields(value, ['revision', 'cfi', 'applePosition'], 'applied position');
+  const revision = integer(value.revision, 'web position revision');
+  const target = cfi(value.cfi), observed = applePosition(value.applePosition);
+  // Apple may save a range at the start of the target text node rather than
+  // the browser's character offset. The paired Mac verifies that read-back;
+  // the store still requires the exact requested web revision and target CFI.
+  if (!revision || !observed || !observed.updatedAt) {
+    throw new HttpError(400, 'Confirm the saved position read back from Apple Books.');
+  }
+  return { revision, cfi: target, applePosition: observed };
+}
+
 function annotation(value) {
   fields(value, ['id', 'type', 'cfi', 'text', 'note', 'color'], 'annotation');
   if (!['highlight', 'bookmark'].includes(value.type)) throw new HttpError(400, 'Invalid annotation type.');

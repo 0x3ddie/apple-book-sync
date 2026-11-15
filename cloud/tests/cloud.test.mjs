@@ -378,7 +378,7 @@ test('metadata import rejects book bytes and file paths; no EPUB or cover route 
   }
 });
 
-test('position CAS rejects competing readers and changed Apple baseline; delayed saves are idempotent', async () => {
+test('web saves win over Apple changes while competing readers and delayed saves stay protected', async () => {
   const alice = await login(); const linked = await pair(alice.cookie); await push(linked.credential);
   const save = (body) => call('/api/books/BOOK1/position', { cookie: alice.cookie, body });
   assert.equal((await save(pos())).body.position.revision, 1);
@@ -389,8 +389,137 @@ test('position CAS rejects competing readers and changed Apple baseline; delayed
   assert.equal((await save(pos({ clientId: 'reader-b', baseRevision: 2 }))).body.position.revision, 3);
   await push(linked.credential, [book({ applePosition: { cfi: 'epubcfi(/6/4!/4/2:0)', updatedAt: '2026-11-14T01:00:00Z', revision: 'apple-v2' } })], 2);
   const changed = await save(pos({ clientId: 'reader-b', sequence: 2, baseRevision: 3 }));
-  assert.equal(changed.status, 409); assert.equal(changed.body.book.syncState, 'conflict');
-  assert.equal((await save(pos({ clientId: 'reader-b', sequence: 2, baseRevision: 3, appleRevision: 'apple-v2' }))).status, 200);
+  assert.equal(changed.status, 200); assert.equal(changed.body.syncState, 'pending');
+  assert.equal(changed.body.position.appleRevision, 'apple-v2');
+  assert.equal(changed.body.position.revision, 4);
+  assert.equal((await save(pos({ clientId: 'reader-a', sequence: 3, baseRevision: 3 }))).status, 409);
+});
+
+const applied = (overrides = {}) => ({
+  revision: 1, cfi: pos().cfi,
+  applePosition: { cfi: pos().cfi, updatedAt: '2026-11-14T00:01:00.000Z', revision: 'apple-applied' },
+  ...overrides,
+});
+const acknowledge = (credential, value = applied(), bookId = 'BOOK1') => call(`/api/companion/positions/${bookId}/applied`, {
+  bearer: credential, originHeader: null, body: value,
+});
+
+test('pending web position stays authoritative until exact native read-back acknowledgement', async () => {
+  const alice = await login(); const linked = await pair(alice.cookie); await push(linked.credential);
+  await call('/api/books/BOOK1/position', { cookie: alice.cookie, body: pos({ percentage: .4 }) });
+  const read = () => call('/api/books/BOOK1', { cookie: alice.cookie });
+  const pending = () => call('/api/companion/positions', { bearer: linked.credential });
+  assert.equal((await pending()).body.positions.length, 1);
+  assert.equal((await read()).body.syncState, 'pending');
+  // A snapshot alone, even at the same CFI, never claims the native handoff ran.
+  await push(linked.credential, [book({ applePosition: applied().applePosition })], 2);
+  assert.equal((await read()).body.syncState, 'pending');
+  assert.deepEqual((await read()).body.resume, { cfi: pos().cfi, source: 'web' });
+  const ack = await acknowledge(linked.credential);
+  assert.equal(ack.status, 200); assert.equal(ack.body.revision, 1);
+  assert.deepEqual((await pending()).body.positions, []);
+  const detail = (await read()).body;
+  assert.equal(detail.syncState, 'synced'); assert.equal(detail.progress, .4);
+  assert.deepEqual(detail.webPosition.applied.applePosition, applied().applePosition);
+  assert.equal(detail.webPosition.applied.deviceId, linked.device.id);
+  assert.equal((await acknowledge(linked.credential)).body.ignored, true);
+});
+
+test('new Apple reading resumes in web after acknowledgement, but older snapshots and new web saves cannot reverse precedence', async () => {
+  const alice = await login(); const linked = await pair(alice.cookie); await push(linked.credential);
+  const save = (body) => call('/api/books/BOOK1/position', { cookie: alice.cookie, body });
+  const read = async () => (await call('/api/books/BOOK1', { cookie: alice.cookie })).body;
+  await save(pos({ percentage: .4 }));
+  await acknowledge(linked.credential);
+  assert.equal((await read()).syncState, 'synced');
+  assert.deepEqual((await read()).resume, { cfi: pos().cfi, source: 'web' });
+  // The imported Apple snapshot is older than the native read-back in the ACK.
+  await push(linked.credential, [book()], 2);
+  assert.equal((await read()).syncState, 'synced');
+  const newerApple = { cfi: 'epubcfi(/6/8!/4/2:0)', updatedAt: '2026-11-14T00:05:00.000Z', revision: 'apple-advanced' };
+  await push(linked.credential, [book({ applePosition: newerApple, progress: .6 })], 3);
+  assert.equal((await read()).syncState, 'apple');
+  assert.deepEqual((await read()).resume, { cfi: newerApple.cfi, source: 'apple' });
+  assert.equal((await read()).progress, .6);
+  assert.deepEqual((await call('/api/companion/positions', { bearer: linked.credential })).body.positions, []);
+  const next = await save(pos({ sequence: 2, cfi: 'epubcfi(/6/10!/4/2:0)' }));
+  assert.equal(next.status, 200); assert.equal(next.body.position.applied, undefined);
+  assert.equal(next.body.position.revision, 2); assert.equal((await read()).syncState, 'pending');
+  assert.deepEqual((await read()).resume, { cfi: next.body.position.cfi, source: 'web' });
+  assert.equal((await call('/api/companion/positions', { bearer: linked.credential })).body.positions.length, 1);
+});
+
+test('stale acknowledgement cannot clear a newer web revision even when its CFI matches', async () => {
+  const alice = await login(); const linked = await pair(alice.cookie); await push(linked.credential);
+  const save = (body) => call('/api/books/BOOK1/position', { cookie: alice.cookie, body });
+  await save(pos());
+  await save(pos({ sequence: 2 }));
+  assert.equal((await acknowledge(linked.credential)).status, 409);
+  assert.equal((await acknowledge(linked.credential, applied({ revision: 2 }))).status, 200);
+  const later = await save(pos({ sequence: 3, cfi: 'epubcfi(/6/12!/4/2:0)' }));
+  assert.equal(later.body.position.revision, 3);
+  assert.equal((await acknowledge(linked.credential, applied({ revision: 3 }))).status, 409);
+  const pending = (await call('/api/companion/positions', { bearer: linked.credential })).body.positions;
+  assert.equal(pending.length, 1); assert.equal(pending[0].position.revision, 3);
+  assert.equal(pending[0].position.applied, undefined);
+});
+
+test('native position acknowledgements are account- and source-Mac-scoped, including replacement and revocation', async () => {
+  const alice = await login(); const bob = await login('bob@example.test');
+  const first = await pair(alice.cookie); const other = await pair(bob.cookie);
+  await push(first.credential);
+  await call('/api/books/BOOK1/position', { cookie: alice.cookie, body: pos() });
+  assert.equal((await acknowledge(other.credential)).status, 404);
+  assert.equal((await call('/api/companion/positions/BOOK1/applied', { cookie: alice.cookie, body: applied() })).status, 403);
+  assert.equal((await call('/api/companion/positions/BOOK1/applied', { cookie: alice.cookie, originHeader: null, body: applied() })).status, 401);
+  const replacement = await pair(alice.cookie, 'Replacement Mac');
+  assert.deepEqual((await call('/api/companion/positions', { bearer: replacement.credential })).body.positions, []);
+  assert.equal((await acknowledge(replacement.credential)).status, 404);
+  assert.equal((await acknowledge(first.credential)).status, 401);
+  await push(replacement.credential);
+  assert.equal((await call('/api/companion/positions', { bearer: replacement.credential })).body.positions.length, 1);
+  assert.equal((await acknowledge(replacement.credential)).status, 200);
+  await call(`/api/devices/${replacement.device.id}/revoke`, { cookie: alice.cookie, body: {} });
+  assert.equal((await acknowledge(replacement.credential)).status, 401);
+});
+
+test('applied positions do not count as applied on a replacement Mac until it confirms the position', async () => {
+  const alice = await login(); const first = await pair(alice.cookie); await push(first.credential);
+  await call('/api/books/BOOK1/position', { cookie: alice.cookie, body: pos() });
+  await acknowledge(first.credential);
+  const replacement = await pair(alice.cookie, 'Replacement Mac'); await push(replacement.credential);
+  assert.equal((await call('/api/books/BOOK1', { cookie: alice.cookie })).body.syncState, 'pending');
+  assert.equal((await call('/api/companion/positions', { bearer: replacement.credential })).body.positions.length, 1);
+  assert.equal((await acknowledge(replacement.credential)).status, 200);
+  assert.equal((await call('/api/books/BOOK1', { cookie: alice.cookie })).body.webPosition.applied.deviceId, replacement.device.id);
+});
+
+test('a paired Mac may acknowledge Apple’s canonicalized range while retaining the exact requested target', async () => {
+  const alice = await login(); const linked = await pair(alice.cookie); await push(linked.credential);
+  const target = 'epubcfi(/6/2!/4/110/1:313)';
+  await call('/api/books/BOOK1/position', { cookie: alice.cookie, body: pos({ cfi: target }) });
+  const observed = { cfi: 'epubcfi(/6/2!/4/110/1,:0,:1)', updatedAt: '2026-11-14T00:01:00.000Z', revision: 'apple-canonical' };
+  assert.equal((await acknowledge(linked.credential, applied({ cfi: observed.cfi, applePosition: observed }))).status, 409);
+  const ack = await acknowledge(linked.credential, applied({ cfi: target, applePosition: observed }));
+  assert.equal(ack.status, 200);
+  const detail = (await call('/api/books/BOOK1', { cookie: alice.cookie })).body;
+  assert.equal(detail.syncState, 'synced');
+  assert.equal(detail.webPosition.cfi, target);
+  assert.deepEqual(detail.webPosition.applied.applePosition, observed);
+  assert.deepEqual((await call('/api/companion/positions', { bearer: linked.credential })).body.positions, []);
+});
+
+test('acknowledgements require valid native read-back metadata and reject unrelated data', async () => {
+  const alice = await login(); const linked = await pair(alice.cookie); await push(linked.credential);
+  await call('/api/books/BOOK1/position', { cookie: alice.cookie, body: pos() });
+  for (const patch of [
+    { revision: 0 }, { revision: 1.5 }, { revision: '1' }, { cfi: 'file:///private' },
+    { applePosition: null }, { applePosition: { ...applied().applePosition, cfi: 'not-an-epub-position' } },
+    { applePosition: { ...applied().applePosition, updatedAt: null } },
+    { applePosition: { ...applied().applePosition, updatedAt: 'yesterday' } },
+    { applePosition: { ...applied().applePosition, epub: 'bytes' } }, { ownerId: 'someone-else' },
+  ]) assert.equal((await acknowledge(linked.credential, applied(patch))).status, 400, JSON.stringify(patch));
+  assert.equal((await call('/api/books/BOOK1', { cookie: alice.cookie })).body.syncState, 'pending');
 });
 
 test('snapshot sequence rejects stale import without overwriting web progress or deleting omitted books', async () => {

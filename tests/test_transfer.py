@@ -10,7 +10,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from companion import CompanionError, SyncClient, write_config
 
@@ -171,6 +171,9 @@ class TransferServiceTest(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch("transfer.SyncClient", return_value=self.client))
         self.library = self.enterContext(patch("transfer.BooksLibrary")).return_value
         self.enterContext(patch("transfer.sync", self.metadata_sync))
+        self.position_sync = Mock()
+        self.position_sync.poll = AsyncMock()
+        self.enterContext(patch("transfer.PositionSync", return_value=self.position_sync))
         self.output = io.StringIO()
         self.enterContext(contextlib.redirect_stdout(self.output))
 
@@ -300,6 +303,36 @@ class TransferServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.request.call_count, 12)
         self.metadata_sync.assert_called_once_with(self.path, self.library, self.client,
                                                    skip_unchanged=False, quiet=False)
+
+    async def test_progress_polls_independently_when_library_metadata_is_unchanged(self):
+        await serve_transfers(minutes=1, path=self.path)
+        self.assertEqual(self.position_sync.poll.await_count, 3)
+        self.metadata_sync.assert_called_once()
+        self.position_sync.clear.assert_called_once()
+
+    async def test_slow_progress_readback_does_not_block_transfer_heartbeats_and_is_cancelled(self):
+        started, stopped = asyncio.Event(), asyncio.Event()
+
+        async def pending_position():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+
+        self.position_sync.poll.side_effect = pending_position
+        await serve_transfers(minutes=1, path=self.path)
+        self.assertTrue(started.is_set())
+        self.assertTrue(stopped.is_set())
+        self.assertEqual(self.client.request.call_count, 12)
+        self.position_sync.clear.assert_called_once()
+
+    async def test_progress_auth_failure_stops_background_service(self):
+        self.position_sync.poll.side_effect = CompanionError("Revoked", status=401)
+        await serve_transfers(path=self.path, background=True)
+        self.assertEqual(self.position_sync.poll.await_count, 1)
+        self.position_sync.clear.assert_called_once()
+        self.assertEqual(self.waits, [20])
 
     async def test_unpaired_background_start_exits_without_polling_or_creating_lock(self):
         self.path.unlink()

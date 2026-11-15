@@ -1,4 +1,4 @@
-"""Pair this Mac and send Apple Books metadata; never upload EPUBs or edit Books."""
+"""Pair this Mac for private library sync and automatic reading-position handoff."""
 
 import argparse
 import fcntl

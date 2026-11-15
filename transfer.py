@@ -22,6 +22,7 @@ from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from companion import CONFIG, CompanionError, SyncClient, read_config, sync
 from covers import cover_bundle
 from library import BooksLibrary
+from position_sync import PositionSync
 
 
 CHANNEL = "books-epub-v1"
@@ -31,6 +32,7 @@ CHUNK_BYTES = 16 * 1024
 HIGH_WATER = 256 * 1024
 POLL_SECONDS = 5
 IDLE_POLL_SECONDS = 20
+POSITION_POLL_SECONDS = 20
 
 
 @contextmanager
@@ -248,6 +250,9 @@ async def _serve_transfers(*, minutes, path, background):
     next_sync = 0
     connected = False
     connection_warning = False
+    positions = PositionSync(client, library, device_id=config["deviceId"])
+    position_task = None
+    next_position_poll = 0
 
     async def refresh_metadata():
         result = await asyncio.to_thread(sync, path, library, client,
@@ -278,6 +283,12 @@ async def _serve_transfers(*, minutes, path, background):
                 connected = True
                 connection_warning = False
                 now = time.monotonic()
+                if position_task is not None and position_task.done():
+                    finished, position_task = position_task, None
+                    finished.result()  # Authentication failure follows the normal stop policy below.
+                if position_task is None and now >= next_position_poll:
+                    position_task = asyncio.create_task(positions.poll())
+                    next_position_poll = now + POSITION_POLL_SECONDS
                 seen = {key: expiry for key, expiry in seen.items() if expiry > now}
                 for item in batch["transfers"][:3]:
                     if not isinstance(item, dict) or not isinstance(item.get("id"), str):
@@ -313,7 +324,10 @@ async def _serve_transfers(*, minutes, path, background):
             interval = IDLE_POLL_SECONDS if read_interrupted or (background and not tasks) else POLL_SECONDS
             await asyncio.sleep(min(interval, max(0, deadline - time.monotonic())))
     finally:
+        positions.clear()
+        if position_task is not None:
+            position_task.cancel()
         for task in tasks.values():
             task.cancel()
-        await asyncio.gather(*tasks.values(), return_exceptions=True)
+        await asyncio.gather(*tasks.values(), *([position_task] if position_task is not None else []), return_exceptions=True)
     print("Transfer window ended. Run ./scripts/start-transfers.sh when you want to save more books.", flush=True)
