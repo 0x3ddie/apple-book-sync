@@ -125,9 +125,11 @@ def apply_position(library, book_id, cfi, *, opener=None, sleep=time.sleep, cloc
         if not library.readable(raw)[0]:
             return None
         previous = library.apple_position(library.raw_annotations(book_id))
+        previous_location = None
         if previous:
             try:
-                if _location(previous.get("cfi")) == target:
+                previous_location = _location(previous.get("cfi"))
+                if previous_location == target:
                     return previous
             except ValueError:
                 pass
@@ -146,7 +148,12 @@ def apply_position(library, book_id, cfi, *, opener=None, sleep=time.sleep, cloc
                 actual = library.apple_position(library.raw_annotations(book_id))
                 if _fresh_position(actual, previous):
                     try:
-                        if _location(actual.get("cfi"))[:2] == target[:2]:
+                        actual_location = _location(actual.get("cfi"))
+                        # Closing an existing reader can update only its save
+                        # timestamp. Offset rounding is evidence of a jump only
+                        # when Books also moved to a different text node.
+                        moved_node = actual_location[:2] != (previous_location[:2] if previous_location else None)
+                        if actual_location == target or actual_location[:2] == target[:2] and moved_node:
                             return actual
                     except ValueError:
                         pass

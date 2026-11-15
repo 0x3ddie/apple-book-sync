@@ -144,13 +144,24 @@ class ProgressTest(unittest.TestCase):
             return True
         self.assertEqual(self.run_apply(open_url, cfi=target), expected)
 
-    def test_timestamp_only_change_is_fresh(self):
+    def test_same_node_timestamp_only_change_does_not_confirm_different_offset(self):
         self.library.current = position(ACTUAL, None)
         expected = position(ACTUAL, None, "2026-11-14T23:42:03+00:00")
         def open_url(_):
             self.library.current = expected
             return True
+        self.assertIsNone(self.run_apply(open_url))
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(self.clock.now, 10)
+
+    def test_same_node_with_exact_requested_offset_and_fresh_timestamp_is_confirmed(self):
+        self.library.current = position(ACTUAL)
+        expected = position(TARGET, "new", NEW_STAMP)
+        def open_url(_):
+            self.library.current = expected
+            return True
         self.assertEqual(self.run_apply(open_url), expected)
+        self.assertEqual(len(self.calls), 1)
 
     def test_changed_revision_with_older_or_unchanged_timestamp_is_not_fresh(self):
         for stamp in ["2026-11-14T23:40:03+00:00", "2026-11-14T23:41:03+00:00"]:
