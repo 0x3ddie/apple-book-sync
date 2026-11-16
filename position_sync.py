@@ -17,6 +17,7 @@ from companion import CompanionError, MAX_SEQUENCE
 DEBOUNCE_SECONDS = 5
 RETRY_SECONDS = 60
 MAX_PER_POLL = 3
+MAX_ATTEMPTS = 3
 MAX_RECEIPTS_BYTES = 1024 * 1024
 
 
@@ -55,7 +56,10 @@ def _receipt(value):
         observed = _apple_position(observed)
     elif value["phase"] == "applied":
         raise ValueError("Missing verified position")
-    return {"phase": value["phase"], "applePosition": observed}
+    attempt = value.get("attempt", 1)
+    if type(attempt) is not int or not 1 <= attempt <= MAX_ATTEMPTS:
+        raise ValueError("Invalid delivery attempt")
+    return {"phase": value["phase"], "applePosition": observed, "attempt": attempt}
 
 
 def _pending(response, device_id):
@@ -74,7 +78,7 @@ def _pending(response, device_id):
             if type(revision) is not int or not 1 <= revision <= MAX_SEQUENCE:
                 raise ValueError("Invalid web revision")
             saved = _timestamp(position.get("savedAt"))
-            delivered_here = False
+            applied_here, delivered_here = False, None
             for field in ("applied", "delivered"):
                 marker = position.get(field)
                 if marker is None:
@@ -82,13 +86,28 @@ def _pending(response, device_id):
                 if not isinstance(marker, dict) or not _identifier(marker.get("deviceId")):
                     raise ValueError("Invalid position receipt")
                 _timestamp(marker.get("at"))
-                _receipt({"phase": field, "applePosition": marker.get("applePosition")})
-                delivered_here |= marker["deviceId"] == device_id
+                receipt = _receipt({"phase": field, "applePosition": marker.get("applePosition"),
+                                    "attempt": marker.get("attempt", 1)})
+                if marker["deviceId"] == device_id:
+                    if field == "applied":
+                        applied_here = True
+                    else:
+                        delivered_here = {**receipt, "at": _timestamp(marker["at"])}
+            if applied_here:
+                continue
+            state = item.get("syncState", "pending")
             if delivered_here:
+                if state != "sent" or delivered_here["attempt"] >= MAX_ATTEMPTS:
+                    continue
+                attempt = delivered_here["attempt"] + 1
+                ready = delivered_here["at"] + RETRY_SECONDS
+            elif state == "pending":
+                attempt, ready = 1, saved + DEBOUNCE_SECONDS
+            else:
                 continue
-            if item.get("syncState", "pending") != "pending":
-                continue
-            result.append({"key": (item["bookId"], revision, position["cfi"]), "saved": saved})
+            result.append({"key": (item["bookId"], revision, position["cfi"]), "saved": saved,
+                           "attempt": attempt, "ready": ready,
+                           "baseline": delivered_here["applePosition"] if delivered_here else None})
     except (ValueError, TypeError, OverflowError):
         raise CompanionError("The sync service returned invalid pending positions.") from None
     return sorted(result, key=lambda item: (item["saved"], item["key"][1]), reverse=True)
@@ -194,6 +213,44 @@ class PositionSync:
             apply = deliver_position
         return apply(self.library, book_id, cfi, cancelled=self.cancelled.is_set)
 
+    def _retry_safe(self, book_id, cfi, baseline):
+        # The metadata upload can lag a person reading on the Mac. Check the
+        # live record before retrying so a stale server snapshot cannot rewind it.
+        actual = self.library.apple_position(self.library.raw_annotations(book_id))
+        if actual is not None:
+            actual = _apple_position(actual)
+        if actual and actual["cfi"] == cfi:
+            return True  # The native helper confirms this without opening Books.
+        if actual is None or baseline is None:
+            return actual is None and baseline is None
+        return actual["cfi"] == baseline["cfi"]
+
+    async def _acknowledge(self, key):
+        book_id, revision, cfi = key
+        receipt = self.receipts[key]
+        # Persist before sending. Replaying this exact receipt after a restart
+        # uses the server's revision/attempt checks and never opens Books again.
+        self._save_receipts()
+        try:
+            result = await asyncio.to_thread(self._request, "POST", f"/api/companion/positions/{book_id}/{receipt['phase']}", {
+                "revision": revision, "cfi": cfi, "applePosition": receipt["applePosition"],
+                **({"attempt": receipt["attempt"]} if receipt["phase"] == "delivered" else {}),
+            })
+            if self.cancelled.is_set():
+                return
+            if not isinstance(result, dict) or result.get("ok") is not True or result.get("revision") != revision:
+                raise CompanionError("The sync service did not confirm the saved position.")
+        except CompanionError as error:
+            if error.status not in (404, 409):
+                # Offline ACKs stay durable; revoked credentials stop the service.
+                raise
+        else:
+            print("Reading position synced to Apple Books." if receipt["phase"] == "applied"
+                  else "Reading position sent to Apple Books.", flush=True)
+        self.receipts.pop(key, None)
+        self.retry_after.pop(key, None)
+        self._save_receipts()
+
     async def poll(self):
         if self.cancelled.is_set():
             return
@@ -202,13 +259,24 @@ class PositionSync:
             return
         pending = _pending(response, self.device_id)
         current = {item["key"] for item in pending}
-        kept = {key: value for key, value in self.receipts.items() if key in current}
+        books = {key[0]: key for key in current}
+        kept = {key: value for key, value in self.receipts.items()
+                if key[0] not in books or books[key[0]] == key}
         if len(kept) != len(self.receipts):
             self.receipts = kept
             self._save_receipts()
         self.retry_after = {key: value for key, value in self.retry_after.items() if key in current}
-        eligible = [item for item in pending if self.clock() - item["saved"] >= DEBOUNCE_SECONDS
-                    and self.clock() >= self.retry_after.get(item["key"], 0)][:MAX_PER_POLL]
+        # A retry can move Books before its ACK reaches the server. A metadata
+        # upload may then remove it from the pending list; its durable receipt
+        # still needs replaying to establish the correct post-dispatch baseline.
+        replayed = list(self.receipts)[:MAX_PER_POLL]
+        for key in replayed:
+            if self.cancelled.is_set():
+                return
+            await self._acknowledge(key)
+        eligible = [item for item in pending if self.clock() >= item["ready"]
+                    and item["key"] not in replayed and item["key"] not in self.receipts
+                    and self.clock() >= self.retry_after.get(item["key"], 0)][:MAX_PER_POLL - len(replayed)]
         for index, item in enumerate(eligible):
             if self.cancelled.is_set():
                 return
@@ -217,13 +285,18 @@ class PositionSync:
             if key not in self.receipts:
                 # Recheck authorization and the target before opening another
                 # book after a potentially slow native read-back.
-                if index:
+                if index or replayed:
                     response = await asyncio.to_thread(self._request, "GET", "/api/companion/positions")
                     if self.cancelled.is_set():
                         return
-                    if key not in {entry["key"] for entry in _pending(response, self.device_id)}:
+                    if (key, item["attempt"]) not in {(entry["key"], entry["attempt"])
+                                                       for entry in _pending(response, self.device_id)}:
                         continue
                 try:
+                    if item["attempt"] > 1 and not await asyncio.to_thread(
+                            self._retry_safe, book_id, cfi, item["baseline"]):
+                        self.retry_after[key] = self.clock() + RETRY_SECONDS
+                        continue
                     delivery = await asyncio.to_thread(self._apply, book_id, cfi)
                     if self.cancelled.is_set():
                         return
@@ -231,36 +304,11 @@ class PositionSync:
                             or type(delivery.get("confirmed")) is not bool):
                         raise ValueError("Position was not delivered")
                     receipt = _receipt({"phase": "applied" if delivery["confirmed"] else "delivered",
-                                        "applePosition": delivery.get("applePosition")})
+                                        "applePosition": delivery.get("applePosition"), "attempt": item["attempt"]})
                 except (OSError, RuntimeError, ValueError, TypeError):
                     self.retry_after[key] = self.clock() + RETRY_SECONDS
                     continue
                 self.receipts[key] = receipt
             if self.cancelled.is_set():
                 return
-            # Persist the result before sending it. An offline ACK or process
-            # restart must not reopen a position already delivered to Books.
-            self._save_receipts()
-            receipt = self.receipts[key]
-            try:
-                result = await asyncio.to_thread(self._request, "POST", f"/api/companion/positions/{book_id}/{receipt['phase']}", {
-                    "revision": revision, "cfi": cfi, "applePosition": receipt["applePosition"],
-                })
-                if self.cancelled.is_set():
-                    return
-                if not isinstance(result, dict) or result.get("ok") is not True or result.get("revision") != revision:
-                    raise CompanionError("The sync service did not confirm the saved position.")
-            except CompanionError as error:
-                if error.status == 409:
-                    self.receipts.pop(key, None)
-                    self.retry_after.pop(key, None)
-                    self._save_receipts()
-                    continue
-                # Keep the durable delivery or read-back after a failed ACK.
-                # The next poll can acknowledge it without reopening Books.
-                raise
-            self.receipts.pop(key, None)
-            self.retry_after.pop(key, None)
-            self._save_receipts()
-            print("Reading position synced to Apple Books." if receipt["phase"] == "applied"
-                  else "Reading position sent to Apple Books.", flush=True)
+            await self._acknowledge(key)

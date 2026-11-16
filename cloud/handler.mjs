@@ -77,7 +77,8 @@ export function createHandler({ store, auth, origin }) {
         if (path === '/api/companion/snapshot' && method === 'POST') {
           return reply(200, await store.importSnapshot(device, snapshot(await jsonBody(request, 1_048_576))));
         }
-        if (path === '/api/companion/positions' && method === 'GET') return reply(200, await store.positions(device));
+        if (path === '/api/companion/positions' && method === 'GET') return reply(200,
+          await store.positions(device, request.headers.get('x-books-position-retry') === '1'));
         const receiptMatch = path.match(/^\/api\/companion\/positions\/([^/]+)\/(applied|delivered)$/);
         if (receiptMatch && method === 'POST') {
           const confirmed = receiptMatch[2] === 'applied';

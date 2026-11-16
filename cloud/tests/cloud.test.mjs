@@ -501,6 +501,68 @@ const acknowledge = (credential, value = applied(), bookId = 'BOOK1') => call(`/
 const delivered = (credential, value = applied(), bookId = 'BOOK1') => call(`/api/companion/positions/${bookId}/delivered`, {
   bearer: credential, originHeader: null, body: value,
 });
+const retryPositions = credential => call('/api/companion/positions', {
+  bearer: credential, headers: { 'x-books-position-retry': '1' },
+});
+
+test('unconfirmed delivery retries after a minute for capable companions and records the new native baseline', async () => {
+  const alice = await login(); const linked = await pair(alice.cookie); await push(linked.credential);
+  await call('/api/books/BOOK1/position', { cookie: alice.cookie, body: pos() });
+  await delivered(linked.credential, applied({ applePosition: book().applePosition }));
+  time += 59_999;
+  assert.deepEqual((await retryPositions(linked.credential)).body.positions, []);
+  time += 1;
+  const pending = (await retryPositions(linked.credential)).body.positions;
+  assert.equal(pending.length, 1); assert.equal(pending[0].syncState, 'sent');
+  assert.equal(pending[0].position.delivered.attempt, 1);
+  assert.deepEqual((await call('/api/companion/positions', { bearer: linked.credential })).body.positions, [], 'Legacy companions never retry a delivered position');
+  const rounded = { cfi: 'epubcfi(/6/2!/4/3:0)', revision: 'rounded', updatedAt: new Date(time).toISOString() };
+  await push(linked.credential, [book({ applePosition: rounded })], 2);
+  assert.equal((await call('/api/books/BOOK1', { cookie: alice.cookie })).body.syncState, 'apple', 'Metadata can arrive before a retried ACK');
+  assert.equal((await delivered(linked.credential, applied({ attempt: 2, applePosition: rounded }))).status, 200);
+  let detail = (await call('/api/books/BOOK1', { cookie: alice.cookie })).body;
+  assert.equal(detail.syncState, 'sent'); assert.equal(detail.resume.source, 'web');
+  assert.deepEqual(detail.webPosition.delivered.applePosition, rounded, 'The retry itself must not look like later human reading');
+  const summary = (await call('/api/library', { cookie: alice.cookie })).body.books[0];
+  assert.equal(summary.webRevision, 1); assert.equal(summary.deliveryAttempt, 2);
+  assert.equal(summary.webPosition, undefined); assert.equal(summary.applePosition, undefined);
+  time += 60_000;
+  const moved = { cfi: 'epubcfi(/6/2!/4/8:0)', revision: 'human-reading', updatedAt: new Date(time).toISOString() };
+  await push(linked.credential, [book({ applePosition: moved })], 3);
+  detail = (await call('/api/books/BOOK1', { cookie: alice.cookie })).body;
+  assert.equal(detail.syncState, 'apple'); assert.equal(detail.resume.cfi, moved.cfi);
+  assert.deepEqual((await retryPositions(linked.credential)).body.positions, []);
+});
+
+test('delivery attempts are sequential, idempotent, capped and cleared by a new web revision', async () => {
+  const alice = await login(); const linked = await pair(alice.cookie); await push(linked.credential);
+  await call('/api/books/BOOK1/position', { cookie: alice.cookie, body: pos() });
+  assert.equal((await delivered(linked.credential, applied({ attempt: 2 }))).status, 409);
+  await delivered(linked.credential); // Legacy receipts count as the first attempt.
+  assert.equal((await delivered(linked.credential, applied({ attempt: 3 }))).status, 409);
+  time += 60_000;
+  assert.equal((await delivered(linked.credential, applied({ attempt: 2 }))).status, 200);
+  const read = async () => (await call('/api/books/BOOK1', { cookie: alice.cookie })).body;
+  const second = (await read()).webPosition.delivered;
+  time += 60_000;
+  assert.equal((await delivered(linked.credential, applied({ attempt: 2 }))).body.ignored, true);
+  assert.deepEqual((await read()).webPosition.delivered, second, 'Replaying a receipt must not reset its cooldown or baseline');
+  assert.equal((await delivered(linked.credential)).status, 409, 'Older receipts cannot roll an attempt backward');
+  assert.equal((await delivered(linked.credential, applied({ attempt: 3 }))).status, 200);
+  time += 60_000;
+  assert.equal((await read()).webPosition.delivered.attempt, 3);
+  assert.deepEqual((await retryPositions(linked.credential)).body.positions, []);
+  assert.equal((await acknowledge(linked.credential)).status, 200, 'Later confirmed read-back can still upgrade the receipt');
+  assert.equal((await read()).syncState, 'synced');
+  assert.equal((await delivered(linked.credential, applied({ attempt: 3 }))).body.ignored, true);
+  await call('/api/books/BOOK1/position', { cookie: alice.cookie, body: pos({ sequence: 2 }) });
+  const next = (await retryPositions(linked.credential)).body.positions[0];
+  assert.equal(next.syncState, 'pending'); assert.equal(next.position.delivered, undefined);
+  assert.equal((await delivered(linked.credential, applied({ attempt: 3 }))).status, 409);
+  for (const attempt of [0, 4, true, 1.5, '2']) {
+    assert.equal((await delivered(linked.credential, applied({ revision: 2, attempt }))).status, 400);
+  }
+});
 
 test('successful URL delivery is sent rather than verified, and only later changed Apple CFI takes over', async () => {
   const alice = await login(); const linked = await pair(alice.cookie); await push(linked.credential);

@@ -114,16 +114,18 @@ function applePosition(value) {
 }
 
 function positionReceipt(value, confirmed) {
-  fields(value, ['revision', 'cfi', 'applePosition'], 'applied position');
+  fields(value, ['revision', 'cfi', 'applePosition', ...(!confirmed ? ['attempt'] : [])], 'applied position');
   const revision = integer(value.revision, 'web position revision');
   const target = cfi(value.cfi), observed = applePosition(value.applePosition);
+  const attempt = confirmed ? null : value.attempt === undefined ? 1 : integer(value.attempt, 'delivery attempt');
+  if (!confirmed && (attempt < 1 || attempt > 3)) throw new HttpError(400, 'A position allows at most three delivery attempts.');
   // Apple may save a range at the start of the target text node rather than
   // the browser's character offset. The paired Mac verifies that read-back;
   // the store still requires the exact requested web revision and target CFI.
   if (!revision || confirmed && !observed || observed && !observed.updatedAt) {
     throw new HttpError(400, 'Confirm the saved position read back from Apple Books.');
   }
-  return { revision, cfi: target, applePosition: observed };
+  return { revision, cfi: target, applePosition: observed, ...(!confirmed ? { attempt } : {}) };
 }
 
 export const appliedPosition = (value) => positionReceipt(value, true);

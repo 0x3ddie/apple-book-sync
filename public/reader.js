@@ -11,7 +11,7 @@ const state = {
   savedBooks: new Map(), coverUrls: new Map(), downloads: new Map(), bridgeOnline: true,
   covers: new Map(), coverBackfilled: new Set(), coverSync: null, coverAttemptedAt: 0,
   offlineReady: false, syncingBackups: false,
-  accountReady: false, anchorCfi: null, appleSyncTimer: null, appleSyncRequest: 0,
+  accountReady: false, anchorCfi: null, appleSyncTimer: null, appleSyncRequest: 0, appleSyncBookId: null,
 };
 
 // Display preferences are per device, not per account, and hold no book data.
@@ -57,7 +57,7 @@ async function api(url, options = {}) {
   const response = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(8000), ...options, headers });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    if (response.status === 401 || response.status === 403) {
+    if ((response.status === 401 || response.status === 403) && window.ReaderAccount.current?.scope === account?.scope) {
       state.accountReady = false;
       state.ready = false;
       window.dispatchEvent(new Event("books-session-expired"));
@@ -250,6 +250,7 @@ function canDownload(book) {
 function bookButton(book, continuing = false) {
   const button = element("button", continuing ? "continue-book" : "book-card");
   button.type = "button";
+  button.dataset.bookId = book.id;
   const saved = state.savedBooks.has(book.id);
   const readable = saved || state.bridgeOnline && book.readable;
   const downloadable = !saved && state.offlineReady && canDownload(book);
@@ -261,9 +262,10 @@ function bookButton(book, continuing = false) {
   if (readable) {
     const meta = bookMeta(book);
     if (meta) info.append(meta);
-    if (readBackup(book.id)) info.append(element("p", "pending-label", "Position saved on this device"));
-    else if (book.syncState === "pending") info.append(element("p", "pending-label", window.ReaderAccount.current?.mode === "cloud" ? "Waiting for Mac to sync" : "Position saved"));
-    else if (book.syncState === "conflict") info.append(element("p", "pending-label", "Another web position is available"));
+    const label = element("p", "pending-label");
+    label.textContent = librarySyncLabel(book);
+    label.hidden = !label.textContent;
+    info.append(label);
     if (continuing) info.append(element("p", "read-label", "Continue reading"));
   } else {
     info.append(element("p", "book-availability", !state.bridgeOnline ? "Not saved on this device" : downloadable ? "Save from your Mac to read here" : window.ReaderAccount.current?.mode === "cloud" ? "Download this EPUB in Apple Books on your Mac first." : book.unavailableReason || "Download this EPUB in Apple Books first."));
@@ -417,7 +419,7 @@ function renderLibrary() {
   const query = el("search").value.trim().toLocaleLowerCase();
   const filtered = state.books.filter((book) => {
     const matches = `${book.title} ${book.author || ""}`.toLocaleLowerCase().includes(query);
-    return matches && (state.filter !== "reading" || book.progress > 0 && book.progress < .99 || book.syncState === "pending")
+    return matches && (state.filter !== "reading" || book.progress > 0 && book.progress < .99 || ["pending", "sent"].includes(book.syncState))
       && (state.filter !== "available" || (book.availableOnMac ?? book.readable))
       && (state.filter !== "saved" || state.savedBooks.has(book.id));
   });
@@ -425,19 +427,21 @@ function renderLibrary() {
   el("shelf").replaceChildren(...filtered.map(shelfItem));
   el("empty-library").hidden = filtered.length > 0;
   el("empty-library").textContent = state.filter === "saved" && !state.savedBooks.size ? "Choose Save offline on a book while connected. It will appear here for your next trip." : state.books.length ? "No books match. Try another title or filter." : window.ReaderAccount.current?.mode === "cloud" ? "Link your Mac to add your books." : "Your library is empty. Add an EPUB to Apple Books on this Mac, then refresh.";
-  const continuing = state.books.filter((book) => (state.savedBooks.has(book.id) || state.bridgeOnline && book.readable) && (book.progress > 0 && book.progress < .99 || book.syncState === "pending" || readBackup(book.id))).slice(0, 3);
+  const continuing = state.books.filter((book) => (state.savedBooks.has(book.id) || state.bridgeOnline && book.readable) && (book.progress > 0 && book.progress < .99 || ["pending", "sent"].includes(book.syncState) || readBackup(book.id))).slice(0, 3);
   el("continue-section").hidden = continuing.length === 0 || !!query || state.filter !== "all";
   el("continue-books").replaceChildren(...continuing.map((book) => bookButton(book, true)));
 }
 
 async function refreshLibrary({ retryCovers = false } = {}) {
   if (!state.accountReady) return;
+  stopAppleSyncCheck();
+  const scope = window.ReaderAccount.current.scope;
   const request = ++state.libraryRequest;
   el("refresh").disabled = true;
   el("library-status").textContent = "Checking your Apple Books library…";
   try {
     const data = await api("/api/library");
-    if (!state.accountReady || request !== state.libraryRequest) return;
+    if (!sameAccount(scope) || request !== state.libraryRequest) return;
     state.bridgeOnline = true;
     state.books = data.books;
     for (const saved of state.savedBooks.values()) if (!state.books.some((book) => book.id === saved.id)) state.books.push(saved.detail);
@@ -451,7 +455,7 @@ async function refreshLibrary({ retryCovers = false } = {}) {
     syncBackups().catch(() => {});
     syncCovers(data, retryCovers).catch(() => {});
   } catch (error) {
-    if (request !== state.libraryRequest) return;
+    if (!sameAccount(scope) || request !== state.libraryRequest) return;
     if (error.status === 401 || error.status === 403) return;
     state.bridgeOnline = false;
     if (!state.books.length) {
@@ -463,7 +467,10 @@ async function refreshLibrary({ retryCovers = false } = {}) {
     el("library-status").textContent = cloud ? "Sync unavailable. Your saved books are ready here." : "Mac disconnected. Your saved books are ready here.";
     showError("library-error", state.savedBooks.size ? "" : cloud ? "Reconnect to refresh your private library." : "Connect to your Mac and save a book before reading offline.");
   } finally {
-    if (request === state.libraryRequest) el("refresh").disabled = false;
+    if (sameAccount(scope) && request === state.libraryRequest) {
+      el("refresh").disabled = false;
+      if (!state.detail && !state.opening) watchAppleSync();
+    }
   }
 }
 
@@ -523,13 +530,61 @@ function status(message, detail) {
   if (detail) el("save-detail").textContent = detail;
 }
 
+function webRevision(book) {
+  return book?.webPosition?.revision ?? book?.webRevision ?? 0;
+}
+
+function deliveryAttempt(book) {
+  if (book?.webPosition) return book.webPosition.delivered?.attempt ?? (book.syncState === "sent" ? 1 : 0);
+  return book?.deliveryAttempt ?? (book?.syncState === "sent" ? 1 : 0);
+}
+
+function awaitingAppleSync(book) {
+  return book?.syncState === "pending" || book?.syncState === "sent" && deliveryAttempt(book) < 3;
+}
+
+function syncLabel(book) {
+  if (window.ReaderAccount.current?.mode !== "cloud") return book?.syncState === "pending" ? "Position saved" : "";
+  if (book?.syncState === "pending") return "Saved · waiting for Mac";
+  if (book?.syncState === "sent") return deliveryAttempt(book) < 3
+    ? "Apple Books hasn’t confirmed this passage" : "Saved on web; Apple Books position unconfirmed";
+  if (book?.syncState === "synced") return "Synced with Apple Books";
+  return "";
+}
+
+function librarySyncLabel(book) {
+  if (readBackup(book.id)) return "Position saved on this device";
+  if (book.syncState === "conflict") return "Another web position is available";
+  const label = syncLabel(book);
+  return book.syncState === "sent" && deliveryAttempt(book) < 3 ? `${label} · retrying automatically` : label;
+}
+
 function syncMessage(detail = state.detail) {
   if (!state.bridgeOnline) return "Your position stays on this device until you’re online.";
   if (window.ReaderAccount.current?.mode !== "cloud") return "Your position is saved in this reader.";
-  if (detail?.syncState === "synced") return "Your position is synced with Apple Books.";
-  if (detail?.syncState === "sent") return "Your Mac sent this position to Apple Books.";
-  if (["pending", "conflict"].includes(detail?.syncState)) return "Your Mac will send this position to Apple Books automatically when it’s online.";
+  if (detail?.syncState === "synced") return "Saved in Apple Books on your Mac.";
+  if (detail?.syncState === "sent") return deliveryAttempt(detail) < 3
+    ? "Retrying automatically while your Mac is online." : "Your web position is saved; Apple Books hasn’t confirmed this passage.";
+  if (["pending", "conflict"].includes(detail?.syncState)) return "Your Mac will try automatically when it’s online.";
   return "Your progress saves automatically.";
+}
+
+function updateLibraryProgress(fresh) {
+  const book = state.books.find((item) => item.id === fresh.id);
+  if (!book) return;
+  Object.assign(book, { progress: fresh.progress, lastReadAt: fresh.lastReadAt, syncState: fresh.syncState,
+    webRevision: webRevision(fresh), deliveryAttempt: deliveryAttempt(fresh) });
+  // Saved-book fallbacks contain full detail; keep their in-memory revision current too.
+  if (book.webPosition) book.webPosition = fresh.webPosition;
+  // Only replace progress and status. Covers, download controls and focus stay intact.
+  for (const button of document.querySelectorAll(".book-card, .continue-book")) {
+    if (button.dataset.bookId !== fresh.id) continue;
+    const info = button.querySelector(".book-info"), label = info?.querySelector(".pending-label");
+    if (label) { label.textContent = librarySyncLabel(book); label.hidden = !label.textContent; }
+    const oldMeta = info?.querySelector(".book-meta"), nextMeta = bookMeta(book);
+    if (oldMeta) { if (nextMeta) oldMeta.replaceWith(nextMeta); else oldMeta.remove(); }
+    else if (nextMeta && info) info.append(nextMeta);
+  }
 }
 
 function stopAppleSyncCheck() {
@@ -540,35 +595,42 @@ function stopAppleSyncCheck() {
 
 function watchAppleSync() {
   stopAppleSyncCheck();
-  if (!state.accountReady || !navigator.onLine || state.draft || !state.detail?.webPosition
-    || state.detail.syncState !== "pending" || window.ReaderAccount.current?.mode !== "cloud"
+  if (!state.accountReady || !navigator.onLine || state.draft
+    || window.ReaderAccount.current?.mode !== "cloud"
     || document.visibilityState === "hidden") return;
-  const request = state.appleSyncRequest, id = state.detail.id, revision = state.detail.webPosition.revision;
+  const inReader = !!state.detail;
+  if (!inReader && state.opening) return;
+  const book = state.detail || state.books.find((item) => item.id === state.appleSyncBookId)
+    || state.books.find((item) => awaitingAppleSync(item) && webRevision(item) && !readBackup(item.id));
+  if (!awaitingAppleSync(book) || !webRevision(book) || readBackup(book.id)) return;
+  state.appleSyncBookId = book.id;
+  const request = state.appleSyncRequest, id = book.id, revision = webRevision(book);
   const scope = window.ReaderAccount.current.scope;
-  let remaining = 12;
+  // Three Mac attempts can span several minutes. Each visible visit has a fixed budget.
+  let remaining = 24;
   const current = () => request === state.appleSyncRequest && sameAccount(scope)
-    && state.detail?.id === id && state.detail.webPosition?.revision === revision && !state.draft;
+    && document.visibilityState !== "hidden" && navigator.onLine && !state.draft && !readBackup(id)
+    && (inReader ? state.detail?.id === id && webRevision(state.detail) === revision
+      : !state.detail && !state.opening && state.appleSyncBookId === id
+        && webRevision(state.books.find((item) => item.id === id)) === revision);
   async function check() {
     state.appleSyncTimer = null;
+    if (!current()) return;
     try {
       const fresh = await api(`/api/books/${encodeURIComponent(id)}`);
-      if (!current() || fresh.webPosition?.revision !== revision) return;
+      if (!current() || webRevision(fresh) !== revision) return;
       state.bridgeOnline = true;
-      state.detail = { ...state.detail, applePosition: fresh.applePosition, webPosition: fresh.webPosition,
-        syncState: fresh.syncState, resume: fresh.resume };
-      if (fresh.syncState === "apple") {
-        status("Apple Books progress updated", "Your next session will resume from Apple Books.");
-        return;
+      updateLibraryProgress(fresh);
+      if (inReader) {
+        state.detail = { ...state.detail, applePosition: fresh.applePosition, webPosition: fresh.webPosition,
+          syncState: fresh.syncState, resume: fresh.resume };
+        if (fresh.syncState === "apple") status("Apple Books progress updated", "Your next session will resume from Apple Books.");
+        else status(syncLabel(fresh) || "Position saved", syncMessage(fresh));
       }
-      if (["sent", "synced"].includes(fresh.syncState)) {
-        status(fresh.syncState === "sent" ? "Sent to Apple Books" : "Synced with Apple Books",
-          fresh.syncState === "sent" ? "Your Mac sent this position to Apple Books." : "Your Mac confirmed your reading position.");
-        return;
-      }
-      if (--remaining > 0) state.appleSyncTimer = setTimeout(check, 5000);
+      if (awaitingAppleSync(fresh) && --remaining > 0) state.appleSyncTimer = setTimeout(check, 10000);
     } catch { /* Keep the saved position; a new visit or page turn checks again. */ }
   }
-  state.appleSyncTimer = setTimeout(check, 5000);
+  state.appleSyncTimer = setTimeout(check, 10000);
 }
 
 function updateLocation(location) {
@@ -602,11 +664,13 @@ function markDraft(cfi, href) {
 }
 
 async function sendDraft(draft, keepalive = false) {
+  const scope = window.ReaderAccount.current.scope;
   const { id, savedLocallyAt, ...payload } = draft;
   const result = await api(`/api/books/${encodeURIComponent(id)}/position`, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload), keepalive,
   });
+  if (!sameAccount(scope)) return;
   if (result.position.cfi !== draft.cfi && state.draft?.sequence === draft.sequence && state.draft?.clientId === draft.clientId) {
     const error = new Error("A newer reading position was saved elsewhere.");
     error.status = 409;
@@ -619,8 +683,13 @@ async function sendDraft(draft, keepalive = false) {
     try { await OfflineBooks.updateDetail(cached.detail); }
     catch { cachedDurably = false; }
   }
+  if (!sameAccount(scope)) return;
   // A server acknowledgement alone is insufficient for the next offline open.
   if (cachedDurably) removeBackup(draft);
+  const summary = state.books.find((book) => book.id === id);
+  if (summary && result.position.revision >= webRevision(summary)) {
+    updateLibraryProgress({ ...summary, webPosition: result.position, syncState: result.syncState });
+  }
   if (state.detail?.id === id) {
     if (result.position.revision >= (state.detail.webPosition?.revision || 0)) {
       state.detail.webPosition = result.position;
@@ -628,7 +697,7 @@ async function sendDraft(draft, keepalive = false) {
     }
     if (state.draft?.sequence === draft.sequence && state.draft?.clientId === draft.clientId) {
       state.draft = null;
-      status(result.syncState === "synced" ? "Synced with Apple Books" : result.syncState === "sent" ? "Sent to Apple Books" : "Position saved", syncMessage());
+      status(syncLabel(state.detail) || "Position saved", syncMessage());
       watchAppleSync();
       el("retry-save").hidden = true;
       if (!state.storageWarning) showError("reader-error", "");
@@ -662,8 +731,10 @@ function syncBackups() {
 }
 
 async function sendBackups() {
+  const scope = window.ReaderAccount.current.scope;
   try {
     for (const book of state.books) {
+      if (!sameAccount(scope)) return;
       if (state.detail?.id === book.id || state.downloads.has(book.id)) continue;
       const backup = readBackup(book.id);
       if (!backup) continue;
@@ -671,14 +742,14 @@ async function sendBackups() {
         // Keep the revision captured offline. A newer position from another
         // web device must not be overwritten by a delayed background save.
         await sendDraft(backup);
-        book.syncState = "pending";
       } catch (error) {
+        if (!sameAccount(scope)) return;
         if (error.status === 409) book.syncState = "conflict";
         else { state.bridgeOnline = false; break; }
       }
     }
   } finally {
-    if (!state.detail) renderLibrary();
+    if (sameAccount(scope) && !state.detail) { renderLibrary(); watchAppleSync(); }
   }
 }
 
@@ -928,6 +999,8 @@ async function turnPage(direction) {
 
 async function openBook(id) {
   if (!state.accountReady || state.opening) return;
+  stopAppleSyncCheck();
+  state.appleSyncBookId = id;
   state.opening = true;
   showError("library-error", "");
   try {
@@ -1007,7 +1080,7 @@ async function openBook(id) {
     el("reader-loading").hidden = true;
     el("done-reading").disabled = false;
     if (state.location) updateLocation(state.location);
-    status(!state.bridgeOnline ? "Reading your saved copy" : position.source === "apple" ? "Opened at your Apple Books position" : position.source === "start" ? "Ready to read" : "Resumed your web reading position",
+    status(!state.bridgeOnline ? "Reading your saved copy" : syncLabel(detail) || (position.source === "apple" ? "Opened at your Apple Books position" : position.source === "start" ? "Ready to read" : "Resumed your web reading position"),
       syncMessage(detail));
     if (position.saveChoice) saveDraft(markDraft(position.cfi, state.location?.start.href)).catch(() => {});
     else watchAppleSync();
@@ -1017,11 +1090,12 @@ async function openBook(id) {
       showError("reader-error", `Couldn’t open this book. ${error.message}`);
       status("Book unavailable", "Return to your library and try another book.");
     } else showError("library-error", error.message);
-  } finally { state.opening = false; }
+  } finally { state.opening = false; if (!state.detail) watchAppleSync(); }
 }
 
 function disposeReader() {
   stopAppleSyncCheck();
+  if (state.detail) state.appleSyncBookId = state.detail.id;
   state.ready = false;
   clearTimeout(relayoutTimer);
   closeSettings();
@@ -1125,8 +1199,10 @@ document.addEventListener("keydown", keyNavigation);
 document.addEventListener("visibilitychange", () => {
   if (!state.accountReady) return;
   if (document.visibilityState === "hidden") { flushOnHide(); stopAppleSyncCheck(); }
-  else if (!state.detail && !state.opening) refreshLibrary();
-  else watchAppleSync();
+  else {
+    watchAppleSync();
+    if (!state.detail && !state.opening && !state.appleSyncTimer) refreshLibrary();
+  }
 });
 window.addEventListener("pagehide", () => { flushOnHide(); cancelDownloads(); });
 function cancelDownloads() {
@@ -1139,12 +1215,20 @@ window.addEventListener("books-account-changing", () => {
   cancelDownloads();
   state.accountReady = false;
   state.ready = false;
+  state.appleSyncBookId = null;
   state.libraryRequest++;
   for (const url of state.coverUrls.values()) URL.revokeObjectURL(url);
   state.coverUrls.clear();
   state.covers.clear();
 });
-window.addEventListener("online", () => { if (!state.accountReady) return; if (state.draft) retrySave().catch(() => {}); else if (!state.detail) refreshLibrary(); else watchAppleSync(); });
+window.addEventListener("online", () => {
+  if (!state.accountReady) return;
+  if (state.draft) retrySave().catch(() => {});
+  else {
+    watchAppleSync();
+    if (!state.detail && !state.appleSyncTimer) refreshLibrary();
+  }
+});
 window.addEventListener("offline", () => {
   if (!state.accountReady) return;
   state.bridgeOnline = false;

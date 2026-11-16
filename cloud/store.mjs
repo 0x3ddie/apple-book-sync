@@ -102,7 +102,8 @@ export class PostgresStore {
   async library(owner) {
     const books = (await this.rows(owner)).map(detail).map((book) => {
       const { annotations, applePosition, webPosition, resume, epubUrl, appleBooksUrl, ...summary } = book;
-      return summary;
+      return { ...summary, webRevision: webPosition?.revision ?? 0,
+        deliveryAttempt: summary.syncState === 'sent' ? webPosition?.delivered?.attempt ?? 1 : 0 };
     });
     books.sort((a, b) => (b.lastReadAt ?? '').localeCompare(a.lastReadAt ?? '') || a.title.localeCompare(b.title));
     const devices = await this.pool.query('SELECT id,transfer_seen_at,revoked_at,covers_supported FROM books_devices WHERE owner_id=$1 AND revoked_at IS NULL', [owner]);
@@ -339,16 +340,22 @@ export class PostgresStore {
     });
   }
 
-  async positions(identity) {
+  async positions(identity, retryUnconfirmed = false) {
     // Pulling a pending position does not claim it has been applied in Apple Books.
     const { rows } = await this.pool.query(`SELECT b.*,p.position AS web_position FROM books_library b
       JOIN books_positions p ON p.owner_id=b.owner_id AND p.book_id=b.book_id
       JOIN books_devices d ON d.owner_id=b.owner_id AND d.id=b.source_device_id
       WHERE b.owner_id=$1 AND b.source_device_id=$2 AND d.revoked_at IS NULL`, [identity.owner, identity.id]);
-    const positions = rows.filter((row) => syncState(row.metadata.applePosition, row.web_position, row.source_device_id) === 'pending').map((row) => ({
-      bookId: row.book_id, position: row.web_position, applePosition: row.metadata.applePosition,
-      syncState: 'pending',
-    }));
+    const positions = rows.flatMap((row) => {
+      const state = syncState(row.metadata.applePosition, row.web_position, row.source_device_id);
+      const delivered = row.web_position.delivered;
+      const retry = retryUnconfirmed && state === 'sent' && (delivered.attempt ?? 1) < 3
+        && this.now().getTime() - Date.parse(delivered.at) >= 60_000;
+      return state === 'pending' || retry ? [{
+        bookId: row.book_id, position: row.web_position, applePosition: row.metadata.applePosition,
+        syncState: state,
+      }] : [];
+    });
     return { positions, refreshedAt: this.now().toISOString() };
   }
 
@@ -363,8 +370,19 @@ export class PostgresStore {
         throw new HttpError(409, 'A newer web position is waiting. Read the pending position again.');
       }
       if (position.applied?.deviceId === identity.id) return { ok: true, ignored: true, revision: position.revision };
-      if (!confirmed && position.delivered?.deviceId === identity.id) return { ok: true, ignored: true, revision: position.revision };
-      position[confirmed ? 'applied' : 'delivered'] = { deviceId: identity.id, at: this.now().toISOString(), applePosition: value.applePosition };
+      const previous = position.delivered?.deviceId === identity.id ? position.delivered : null;
+      if (!confirmed) {
+        const attempt = value.attempt ?? 1, previousAttempt = previous ? previous.attempt ?? 1 : 0;
+        if (attempt === previousAttempt) return { ok: true, ignored: true, revision: position.revision };
+        if (attempt !== previousAttempt + 1 || attempt > 3) {
+          throw new HttpError(409, 'This delivery attempt is no longer current. Read the pending position again.');
+        }
+      }
+      position[confirmed ? 'applied' : 'delivered'] = {
+        deviceId: identity.id, at: this.now().toISOString(),
+        applePosition: value.applePosition,
+        ...(!confirmed ? { attempt: value.attempt ?? 1 } : {}),
+      };
       await client.query('UPDATE books_positions SET position=$3::jsonb WHERE owner_id=$1 AND book_id=$2', [identity.owner, bookId, JSON.stringify(position)]);
       return { ok: true, revision: position.revision };
     });

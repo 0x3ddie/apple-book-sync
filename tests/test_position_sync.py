@@ -12,6 +12,7 @@ from unittest.mock import Mock
 
 from companion import CompanionError
 from position_sync import PositionSync
+from progress import deliver_position
 
 
 NOW = datetime(2026, 11, 14, tzinfo=timezone.utc).timestamp()
@@ -33,6 +34,14 @@ def actual():
 
 def delivery(confirmed=True):
     return {"delivered": True, "confirmed": confirmed, "applePosition": actual()}
+
+
+def sent(attempt=1, baseline=None, age=60):
+    result = item()
+    result["syncState"] = "sent"
+    result["position"]["delivered"] = {"deviceId": "this-mac", "at": stamp(NOW - age),
+                                       "applePosition": baseline, "attempt": attempt}
+    return result
 
 
 class PositionSyncTest(unittest.IsolatedAsyncioTestCase):
@@ -233,6 +242,143 @@ class PositionSyncTest(unittest.IsolatedAsyncioTestCase):
         await self.sync.poll()
         self.assertEqual(self.posts[0][0], "/api/companion/positions/BOOK1/delivered")
         self.assertIsNone(self.posts[0][1]["applePosition"])
+
+    async def test_real_delivery_helper_recovers_from_ignored_url_and_stops_after_confirmed_retry(self):
+        current = {"cfi": "epubcfi(/6/2!/4/2:0)", "revision": "before", "updatedAt": stamp(NOW - 30)}
+        self.library.raw_book.return_value = {"ZASSETID": "BOOK1"}
+        self.library.readable.return_value = (True, None)
+        self.library.apple_position.side_effect = lambda _: current.copy()
+        native_time, opens = [0], []
+
+        def opener(url):
+            opens.append(url)
+            if self.now >= NOW + 60:
+                current.update(cfi=item()["position"]["cfi"], revision="confirmed", updatedAt=stamp(self.now))
+            return True
+
+        def native_apply(library, book_id, cfi, **kwargs):
+            return deliver_position(library, book_id, cfi, opener=opener, clock=lambda: native_time[0],
+                                    sleep=lambda seconds: native_time.__setitem__(0, native_time[0] + seconds), **kwargs)
+
+        def request(method, endpoint, payload=None):
+            if method == "GET":
+                return {"positions": copy.deepcopy(self.pending)}
+            self.posts.append((endpoint, payload))
+            phase = endpoint.rsplit("/", 1)[1]
+            self.pending[0]["position"][phase] = {"deviceId": "this-mac", "at": stamp(self.now),
+                "applePosition": payload["applePosition"], **({"attempt": payload["attempt"]} if phase == "delivered" else {})}
+            self.pending[0]["syncState"] = "synced" if phase == "applied" else "sent"
+            return {"ok": True, "revision": payload["revision"]}
+
+        self.sync.apply = native_apply
+        self.client.request.side_effect = request
+        await self.sync.poll()
+        self.assertEqual(len(opens), 2, "The first bounded native dispatch was accepted but ignored")
+        self.assertEqual(self.posts[0][0], "/api/companion/positions/BOOK1/delivered")
+        self.assertEqual(self.posts[0][1]["attempt"], 1)
+        self.now += 59
+        await self.sync.poll()
+        self.assertEqual(len(opens), 2)
+        self.now += 1
+        await self.sync.poll()
+        self.assertEqual(len(opens), 3)
+        self.assertEqual(self.posts[-1][0], "/api/companion/positions/BOOK1/applied")
+        self.assertEqual(current["cfi"], item()["position"]["cfi"])
+        self.now += 120
+        await self.sync.poll()
+        self.assertEqual(len(opens), 3, "A confirmed retry must never reopen the position again")
+
+    async def test_retry_checks_live_native_position_before_reopening(self):
+        self.pending = [sent(baseline=actual())]
+        self.library.apple_position.return_value = {**actual(), "cfi": "epubcfi(/6/8!/4/2:0)", "updatedAt": stamp(NOW + 1)}
+        await self.sync.poll()
+        self.apply.assert_not_called()
+        self.assertEqual(self.posts, [])
+        self.library.apple_position.return_value = actual()
+        self.now += 60
+        await self.sync.poll()
+        self.apply.assert_called_once()
+
+    async def test_retry_with_unknown_baseline_never_rewinds_a_newly_available_native_position(self):
+        self.pending = [sent()]
+        self.library.apple_position.return_value = actual()
+        await self.sync.poll()
+        self.apply.assert_not_called()
+        self.library.apple_position.return_value = None
+        self.now += 60
+        await self.sync.poll()
+        self.apply.assert_called_once()
+
+    async def test_retry_cap_and_legacy_delivery_attempts(self):
+        self.pending = [sent(attempt=3, baseline=actual())]
+        self.library.apple_position.return_value = actual()
+        await self.sync.poll()
+        self.apply.assert_not_called()
+        self.pending = [sent(baseline=actual())]
+        del self.pending[0]["position"]["delivered"]["attempt"]
+        self.apply.return_value = delivery(confirmed=False)
+        await self.sync.poll()
+        self.assertEqual(self.posts[0][1]["attempt"], 2)
+
+    async def test_retry_receipt_survives_restart_without_opening_again_after_ack_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "progress-receipts.json"
+            self.pending = [sent(baseline=actual())]
+            self.library.apple_position.return_value = actual()
+            self.apply.return_value = delivery(confirmed=False)
+            sync = PositionSync(self.client, self.library, device_id="this-mac", apply=self.apply,
+                                clock=lambda: self.now, cache_path=path)
+
+            def request(method, endpoint, payload=None):
+                if method == "POST":
+                    self.assertEqual(payload["attempt"], 2)
+                    raise CompanionError("Network unavailable")
+                return self.request(method, endpoint, payload)
+
+            self.client.request.side_effect = request
+            with self.assertRaises(CompanionError):
+                await sync.poll()
+            self.assertEqual(json.loads(path.read_text())["receipts"][0]["attempt"], 2)
+            restarted = PositionSync(self.client, self.library, device_id="this-mac", apply=self.apply,
+                                     clock=lambda: self.now, cache_path=path)
+            # Metadata can report the new native location before the retry ACK
+            # succeeds, temporarily removing this revision from the retry list.
+            self.pending = []
+            self.client.request.side_effect = self.request
+            self.library.apple_position.side_effect = AssertionError("A durable receipt must bypass native access")
+            await restarted.poll()
+            self.assertEqual(self.apply.call_count, 1)
+            self.assertEqual(self.posts[0][1]["attempt"], 2)
+            self.assertEqual(json.loads(path.read_text())["receipts"], [])
+
+    async def test_absent_target_replays_only_receipt_and_discards_removed_or_stale_targets(self):
+        for response_status in (404, 409, 401, 403):
+            with self.subTest(status=response_status), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "progress-receipts.json"
+                path.write_text(json.dumps({"version": 1, "deviceId": "this-mac", "receipts": [{
+                    "bookId": "BOOK1", "revision": 1, "cfi": item()["position"]["cfi"],
+                    "phase": "delivered", "attempt": 2, "applePosition": actual(),
+                }]}))
+                path.chmod(0o600)
+                sync = PositionSync(self.client, self.library, device_id="this-mac", apply=self.apply,
+                                    clock=lambda: self.now, cache_path=path)
+
+                def request(method, endpoint, payload=None):
+                    if method == "GET":
+                        return {"positions": []}
+                    self.assertEqual(payload["attempt"], 2)
+                    raise CompanionError("Target unavailable", status=response_status)
+
+                self.client.request.side_effect = request
+                if response_status in (401, 403):
+                    with self.assertRaises(CompanionError) as caught:
+                        await sync.poll()
+                    self.assertEqual(caught.exception.status, response_status)
+                    self.assertEqual(len(json.loads(path.read_text())["receipts"]), 1)
+                else:
+                    await sync.poll()
+                    self.assertEqual(json.loads(path.read_text())["receipts"], [])
+                self.apply.assert_not_called()
 
     async def test_delivered_marker_for_this_mac_prevents_reopening_without_claiming_applied(self):
         self.pending[0]["position"]["delivered"] = {"deviceId": "this-mac", "at": stamp(NOW), "applePosition": None}
