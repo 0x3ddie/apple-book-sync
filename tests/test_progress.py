@@ -33,12 +33,13 @@ class Library:
         self.current = current or position(OLD)
         self.other = position("epubcfi(/6/4!/4/2/1:0)")
         self.available = readable
+        self.source = "file:///iCloud/Books/book-one.epub"
         self.read_ids = []
 
     def raw_book(self, identifier):
         if identifier != "book-one":
             raise KeyError("Missing book")
-        return {"ZASSETID": identifier}
+        return {"ZASSETID": identifier, "ZPATH": self.source}
 
     def readable(self, raw):
         return self.available, "Unavailable"
@@ -112,14 +113,28 @@ class ProgressTest(unittest.TestCase):
         self.assertEqual(len(self.calls), 2)
         self.assertEqual(self.clock.now, 5)
 
-    def test_unavailable_missing_and_failed_open_leave_pending(self):
-        self.library.available = False
-        self.assertIsNone(self.run_apply(lambda _: self.fail("Unavailable book must not open")))
+    def test_unknown_non_epub_and_failed_open_leave_pending(self):
+        for source in (None, "file:///iCloud/Books/book-one.pdf"):
+            self.library.source = source
+            self.assertIsNone(self.run_apply(lambda _: self.fail("Non-EPUB book must not open")))
         self.assertIsNone(self.run_apply(lambda _: self.fail("Unknown book must not open"), identifier="missing"))
-        self.library.available = True
+        self.library.source = "file:///iCloud/Books/book-one.epub"
         self.assertIsNone(self.run_apply(lambda _: False))
         self.assertEqual(len(self.calls), 2)
         self.assertEqual(self.clock.now, 0)
+
+    def test_icloud_epub_handoff_does_not_require_locally_downloaded_bytes(self):
+        self.library.available = False
+        expected = position(ACTUAL, "new", NEW_STAMP)
+
+        def open_url(_):
+            self.library.current = expected
+            return True
+
+        with patch.object(self.library, "readable", side_effect=AssertionError("Native handoff must not check transfer readability")), \
+                patch("pathlib.Path.stat", side_effect=AssertionError("Native handoff must not probe the EPUB package")):
+            self.assertEqual(self.run_apply(open_url), expected)
+        self.assertEqual(len(self.calls), 1)
 
     def test_invalid_and_out_of_bounds_inputs_never_read_or_open(self):
         malformed = [None, "", "epubcfi()", "epubcfi(/6/12!/4/1:-1)",

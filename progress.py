@@ -6,6 +6,8 @@ import time
 from datetime import datetime
 from urllib.parse import quote
 
+from library import source_path
+
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9._:-]{1,200}")
 _STEPS = re.compile(r"(?:/[1-9][0-9]*)+")
@@ -129,7 +131,11 @@ def deliver_position(library, book_id, cfi, *, opener=None, sleep=time.sleep, cl
         if cancelled():
             return _receipt()
         raw = library.raw_book(book_id)
-        if not library.readable(raw)[0]:
+        # Native Books can open its own iCloud EPUB even when the package is
+        # dataless locally. Download/readability checks belong to file transfer;
+        # handing Books a position needs only an existing EPUB library entry.
+        source = source_path(raw)
+        if source is None or source.suffix.lower() != ".epub":
             return _receipt()
         previous = library.apple_position(library.raw_annotations(book_id))
         previous_location = None

@@ -245,7 +245,7 @@ class PositionSyncTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_delivery_helper_recovers_from_ignored_url_and_stops_after_confirmed_retry(self):
         current = {"cfi": "epubcfi(/6/2!/4/2:0)", "revision": "before", "updatedAt": stamp(NOW - 30)}
-        self.library.raw_book.return_value = {"ZASSETID": "BOOK1"}
+        self.library.raw_book.return_value = {"ZASSETID": "BOOK1", "ZPATH": "/iCloud/Books/book-one.epub"}
         self.library.readable.return_value = (True, None)
         self.library.apple_position.side_effect = lambda _: current.copy()
         native_time, opens = [0], []
@@ -303,7 +303,7 @@ class PositionSyncTest(unittest.IsolatedAsyncioTestCase):
         self.pending = [sent(baseline=actual())]
         saved = {"cfi": "epubcfi(/6/2[chapter]!/4/110/1,:313,:314)",
                  "revision": "delayed-save", "updatedAt": stamp(NOW)}
-        self.library.raw_book.return_value = {"ZASSETID": "BOOK1"}
+        self.library.raw_book.return_value = {"ZASSETID": "BOOK1", "ZPATH": "/iCloud/Books/book-one.epub"}
         self.library.readable.return_value = (True, None)
         self.library.apple_position.return_value = saved
 
