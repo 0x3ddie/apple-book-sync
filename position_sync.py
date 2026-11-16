@@ -219,8 +219,15 @@ class PositionSync:
         actual = self.library.apple_position(self.library.raw_annotations(book_id))
         if actual is not None:
             actual = _apple_position(actual)
-        if actual and actual["cfi"] == cfi:
-            return True  # The native helper confirms this without opening Books.
+        if actual:
+            from progress import _location
+            try:
+                if _location(actual["cfi"]) == _location(cfi):
+                    # Books can express the same endpoint as an asserted range.
+                    # The native helper confirms it without opening Books again.
+                    return True
+            except ValueError:
+                pass
         if actual is None or baseline is None:
             return actual is None and baseline is None
         return actual["cfi"] == baseline["cfi"]

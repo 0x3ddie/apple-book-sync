@@ -299,6 +299,24 @@ class PositionSyncTest(unittest.IsolatedAsyncioTestCase):
         await self.sync.poll()
         self.apply.assert_called_once()
 
+    async def test_canonical_target_saved_after_dispatch_is_confirmed_without_reopening(self):
+        self.pending = [sent(baseline=actual())]
+        saved = {"cfi": "epubcfi(/6/2[chapter]!/4/110/1,:313,:314)",
+                 "revision": "delayed-save", "updatedAt": stamp(NOW)}
+        self.library.raw_book.return_value = {"ZASSETID": "BOOK1"}
+        self.library.readable.return_value = (True, None)
+        self.library.apple_position.return_value = saved
+
+        def native_apply(library, book_id, cfi, **kwargs):
+            return deliver_position(library, book_id, cfi,
+                                    opener=lambda _: self.fail("The exact saved endpoint must not reopen Books"), **kwargs)
+
+        self.sync.apply = native_apply
+        await self.sync.poll()
+        self.assertEqual(self.posts, [("/api/companion/positions/BOOK1/applied", {
+            "revision": 1, "cfi": item()["position"]["cfi"], "applePosition": saved,
+        })])
+
     async def test_retry_with_unknown_baseline_never_rewinds_a_newly_available_native_position(self):
         self.pending = [sent()]
         self.library.apple_position.return_value = actual()
